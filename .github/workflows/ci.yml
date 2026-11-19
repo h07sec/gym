@@ -1,0 +1,67 @@
+name: GymOS CI & Security Validation
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  verify:
+    name: Typecheck, Security Rules, Unit & Emulator Tests, Docker Runtime
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Setup Java 21 (for Firebase Firestore Emulator)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Install dependencies (frozen lockfile)
+        run: bun install --frozen-lockfile
+
+      - name: TypeScript typecheck
+        run: bun run lint
+
+      - name: Lint Firestore security rules
+        run: bun run lint:rules
+
+      - name: Run unit, domain, rules-structure, and server-security tests
+        run: bun run test
+
+      - name: Install Firebase CLI & run Firestore Emulator security tests (mandatory)
+        run: |
+          npm install -g firebase-tools
+          bun run test:emulator
+
+      - name: Build production client and server bundles
+        run: bun run build
+
+      - name: Build Docker production image & verify /healthz startup
+        run: |
+          docker build -t gymos:ci .
+          docker run -d --name gymos-ci-test -p 3000:3000 -e PORT=3000 gymos:ci
+          trap "docker rm -f gymos-ci-test || true" EXIT
+          for i in $(seq 1 15); do
+            if curl -fsS http://127.0.0.1:3000/healthz; then
+              echo "Healthcheck passed!"
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs gymos-ci-test
+          exit 1

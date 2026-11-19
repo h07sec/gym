@@ -627,6 +627,14 @@ service cloud.firestore {
     // -------------------------------------------------------------------------
     // Phase 4: Collections & Master Gate Rules
     // -------------------------------------------------------------------------
+    match /platform_bootstrap/{docId} {
+      allow read, write: if false;
+    }
+
+    match /system_locks/{lockId} {
+      allow read, write: if false;
+    }
+
     match /platform_admins/{uid} {
       allow get: if isValidId(uid) && (isSuperAdmin() || (isSignedIn() && request.auth.uid == uid));
       allow list: if isSuperAdmin();

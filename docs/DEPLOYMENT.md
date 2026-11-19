@@ -11,12 +11,12 @@ cp .env.example .env
 ```
 
 - `PORT` (default `3000`) and `APP_URL`
-- `FIREBASE_SERVICE_ACCOUNT_JSON` (single-line JSON string) or `GOOGLE_APPLICATION_CREDENTIALS`: Required outside Google Cloud ADC environments for `POST /api/admin/bootstrap`, `scripts/init-super-admin.mjs`, and `POST /api/cron/reminders` / background retry sweeps.
-- `SUPER_ADMIN_BOOTSTRAP_TOKEN`: One-time secret used to initialize the first Super Admin via `/admin` (`POST /api/admin/bootstrap`). Clear after initial setup.
+- `FIREBASE_SERVICE_ACCOUNT_JSON` (single-line JSON string) or `GOOGLE_APPLICATION_CREDENTIALS`: Required outside Google Cloud ADC environments for `POST /api/notifications/send`, `POST /api/admin/bootstrap`, `scripts/init-super-admin.mjs`, and `POST /api/cron/reminders` / background automated reminder generation & retry sweeps.
+- `SUPER_ADMIN_BOOTSTRAP_TOKEN` and `SUPER_ADMIN_BOOTSTRAP_EMAIL`: Required together for one-time initial Super Admin bootstrap via `/admin` (`POST /api/admin/bootstrap`). Automatically locked via `/platform_bootstrap/default` and invalidated in memory after first success; clear both after setup.
 - `SMTP_HOST`, `SMTP_PORT`, `SMTP_SECURE`, `SMTP_USER`, `SMTP_PASS`, `SMTP_FROM`: Free-first SMTP email configuration for member & owner reminders.
 - `WHATSAPP_CLOUD_ACCESS_TOKEN`, `WHATSAPP_API_VERSION`: Optional official Meta WhatsApp Business Cloud API token. Each gym still requires its own Phone Number ID and approved template in **Reminders**.
 - `CRON_SECRET`: Shared bearer token protecting `POST /api/cron/reminders`.
-- `REMINDER_WORKER_INTERVAL_MINUTES` (default `30`, set `0` to disable): Interval for automatic in-process `RETRY_SCHEDULED` reminder sweeps when Admin Firestore credentials are present.
+- `REMINDER_WORKER_INTERVAL_MINUTES` (default `30`, set `0` to disable): Interval for automatic server-side due-reminder evaluation, in-app/email/WhatsApp dispatch, and exponential-backoff retries (`15m -> 60m -> 240m`, max 3 retries) with distributed Firestore worker locking (`system_locks/*`).
 
 > **Security Note**: Never place private credentials (`SMTP_PASS`, `CRON_SECRET`, `SUPER_ADMIN_BOOTSTRAP_TOKEN`, `WHATSAPP_CLOUD_ACCESS_TOKEN`, `FIREBASE_SERVICE_ACCOUNT_JSON`) in `VITE_*` variables. Server secrets stay exclusively on the Node.js backend.
 

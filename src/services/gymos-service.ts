@@ -63,7 +63,12 @@ import {
   isPotentialDuplicateCashPayment,
   validatePaymentConfirmationTransition,
 } from '../lib/domain/payments';
-import { computeNextRetryState, evaluateDueReminders } from '../lib/domain/reminders';
+import {
+  buildReminderLogId,
+  computeNextRetryState,
+  computeRetryBackoffMinutes,
+  evaluateDueReminders,
+} from '../lib/domain/reminders';
 import { computeEffectiveAccessEndIso } from '../lib/domain/subscription';
 import { generateHumanCode, generateSecureId, toIsoDate } from '../lib/utils';
 
@@ -171,13 +176,14 @@ export async function fetchServerNotificationCapabilities(): Promise<ServerCapab
 }
 
 async function dispatchExternalReminder(payload: {
+  gymId: string;
+  memberId: string;
+  targetType: 'MEMBER' | 'OWNER_SUBSCRIPTION';
   channel: ReminderChannel.EMAIL | ReminderChannel.WHATSAPP_CLOUD;
-  recipient: string;
+  category?: string;
+  template?: string;
   subject: string;
   message: string;
-  fromName?: string;
-  whatsappPhoneNumberId?: string;
-  whatsappApprovedTemplate?: string;
   whatsappTemplateParams?: string[];
 }): Promise<{
   delivered: boolean;
@@ -2556,8 +2562,10 @@ export async function runReminderBatchForGym(
   try {
     const batch = writeBatch(db);
     for (const c of candidates) {
-      const logId = generateSecureId('nlog');
+      const logId = buildReminderLogId(c.dedupKey);
       const attemptTime = new Date().toISOString();
+      const targetType =
+        c.memberId === `owner_${gym.id}` ? 'OWNER_SUBSCRIPTION' : 'MEMBER';
       let status = DeliveryStatus.SENT;
       let errorDetails: string | undefined;
       let providerMessageId: string | undefined;
@@ -2581,11 +2589,14 @@ export async function runReminderBatchForGym(
         });
       } else if (c.channel === ReminderChannel.EMAIL) {
         const outcome = await dispatchExternalReminder({
+          gymId: gym.id,
+          memberId: c.memberId,
+          targetType,
           channel: ReminderChannel.EMAIL,
-          recipient: c.recipient,
+          category: c.category,
+          template: c.template,
           subject: c.subject,
           message: c.message,
-          fromName: settings.emailFromName || gym.name,
         });
         if (outcome.delivered) {
           sent += 1;
@@ -2599,12 +2610,14 @@ export async function runReminderBatchForGym(
         }
       } else if (c.channel === ReminderChannel.WHATSAPP_CLOUD) {
         const outcome = await dispatchExternalReminder({
+          gymId: gym.id,
+          memberId: c.memberId,
+          targetType,
           channel: ReminderChannel.WHATSAPP_CLOUD,
-          recipient: c.recipient,
+          category: c.category,
+          template: c.template,
           subject: c.subject,
           message: c.message,
-          whatsappPhoneNumberId: settings.whatsappPhoneNumberId,
-          whatsappApprovedTemplate: settings.whatsappApprovedTemplate,
           whatsappTemplateParams: [c.memberName, c.template.replace(/_/g, ' ')],
         });
         if (outcome.delivered) {
@@ -2637,7 +2650,11 @@ export async function runReminderBatchForGym(
         ...(providerMessageId ? { providerMessageId } : {}),
         ...(errorDetails ? { errorDetails: errorDetails.slice(0, 400) } : {}),
         ...(status === DeliveryStatus.RETRY_SCHEDULED
-          ? { nextRetryAt: new Date(Date.now() + 30 * 60 * 1000).toISOString() }
+          ? {
+              nextRetryAt: new Date(
+                Date.now() + computeRetryBackoffMinutes(0) * 60 * 1000
+              ).toISOString(),
+            }
           : {}),
         createdAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
@@ -2667,7 +2684,7 @@ export async function runReminderBatchForGym(
 
 export async function retryNotificationLog(
   gym: Gym,
-  settings: GymSettings,
+  _settings: GymSettings,
   log: NotificationLog
 ): Promise<{ delivered: boolean; errorDetails?: string }> {
   const path = `gyms/${gym.id}/notification_logs/${log.id}`;
@@ -2684,13 +2701,15 @@ export async function retryNotificationLog(
     const subject = `${gym.name}: Reminder (${log.template.replace(/_/g, ' ')})`;
     const message = `Hi ${log.memberName}, this is a follow-up reminder from ${gym.name} regarding ${log.template.replace(/_/g, ' ').toLowerCase()}.`;
     const outcome = await dispatchExternalReminder({
+      gymId: gym.id,
+      memberId: log.memberId,
+      targetType:
+        log.memberId === `owner_${gym.id}` ? 'OWNER_SUBSCRIPTION' : 'MEMBER',
       channel: log.channel,
-      recipient: log.recipient,
+      category: log.category,
+      template: log.template,
       subject,
       message,
-      fromName: settings.emailFromName || gym.name,
-      whatsappPhoneNumberId: settings.whatsappPhoneNumberId,
-      whatsappApprovedTemplate: settings.whatsappApprovedTemplate,
       whatsappTemplateParams: [log.memberName, log.template.replace(/_/g, ' ')],
     });
     delivered = outcome.delivered;
@@ -2714,9 +2733,7 @@ export async function retryNotificationLog(
           }
         : {
             errorDetails: (next.errorDetails || 'Delivery retry failed').slice(0, 400),
-            ...(next.canRetry
-              ? { nextRetryAt: new Date(Date.now() + 30 * 60 * 1000).toISOString() }
-              : { nextRetryAt: '' }),
+            nextRetryAt: next.nextRetryAt,
           }),
       updatedAt: serverTimestamp(),
     });

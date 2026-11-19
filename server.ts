@@ -20,6 +20,18 @@ import {
   getFirestore,
   type Firestore as AdminFirestore,
 } from 'firebase-admin/firestore';
+import {
+  BootstrapController,
+  timingSafeMatch,
+} from './src/server/bootstrap-service';
+import type { DbClient } from './src/server/firestore-types';
+import { emitStructuredLog } from './src/server/logger';
+import {
+  authorizeAndResolveNotificationDispatch,
+  HttpError,
+} from './src/server/notification-guard';
+import { SlidingWindowRateLimiter } from './src/server/rate-limiter';
+import { ReminderWorker } from './src/server/reminder-worker';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -31,6 +43,7 @@ interface FirebaseClientConfig {
 
 interface ServerEnvConfig {
   port: number;
+  host: string;
   appUrl: string;
   smtpHost: string;
   smtpPort: number;
@@ -43,6 +56,7 @@ interface ServerEnvConfig {
   whatsappApiVersion: string;
   whatsappConfigured: boolean;
   bootstrapToken: string;
+  bootstrapEmail: string;
   cronSecret: string;
   reminderWorkerIntervalMinutes: number;
   serviceAccount: ServiceAccount | null;
@@ -63,40 +77,91 @@ function loadFirebaseConfig(): FirebaseClientConfig {
   if (!fs.existsSync(cfgPath)) {
     throw new Error(`Missing firebase-applet-config.json at ${cfgPath}`);
   }
-  const parsed = JSON.parse(fs.readFileSync(cfgPath, 'utf-8')) as FirebaseClientConfig;
+  const parsed = JSON.parse(
+    fs.readFileSync(cfgPath, 'utf-8')
+  ) as FirebaseClientConfig;
   if (!parsed.projectId) {
     throw new Error('Invalid firebase-applet-config.json: missing projectId.');
   }
   return parsed;
 }
 
+function parseCliServerArgs(argv: string[]): { port?: string; host?: string } {
+  const result: { port?: string; host?: string } = {};
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg === '--port' && argv[i + 1]) {
+      result.port = argv[++i];
+    } else if (arg.startsWith('--port=')) {
+      result.port = arg.slice('--port='.length);
+    } else if (arg === '--host' && argv[i + 1]) {
+      result.host = argv[++i];
+    } else if (arg.startsWith('--host=')) {
+      result.host = arg.slice('--host='.length);
+    }
+  }
+  return result;
+}
+
 function validateEnv(): ServerEnvConfig {
-  const rawPort = process.env.PORT?.trim() || '3000';
+  const cliArgs = parseCliServerArgs(process.argv.slice(2));
+  const envPort = process.env.PORT?.trim();
+  const nginxPort = process.env.NGINX_PORT?.trim();
+  const fallbackAppPort = process.env.DEFAULT_APP_PORT?.trim() || '3000';
+  const rawPort =
+    cliArgs.port?.trim() ||
+    (envPort && (!nginxPort || envPort !== nginxPort)
+      ? envPort
+      : fallbackAppPort);
   const port = Number(rawPort);
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
-    throw new Error(`Invalid PORT "${rawPort}". Must be an integer between 1 and 65535.`);
+    throw new Error(
+      `Invalid PORT "${rawPort}". Must be an integer between 1 and 65535.`
+    );
   }
+  const host = cliArgs.host?.trim() || process.env.HOST?.trim() || '0.0.0.0';
 
   const smtpHost = process.env.SMTP_HOST?.trim() || '';
   const rawSmtpPort = process.env.SMTP_PORT?.trim() || '587';
   const smtpPort = Number(rawSmtpPort);
-  if (smtpHost && (!Number.isInteger(smtpPort) || smtpPort < 1 || smtpPort > 65535)) {
-    throw new Error(`Invalid SMTP_PORT "${rawSmtpPort}". Must be a valid TCP port.`);
+  if (
+    smtpHost &&
+    (!Number.isInteger(smtpPort) || smtpPort < 1 || smtpPort > 65535)
+  ) {
+    throw new Error(
+      `Invalid SMTP_PORT "${rawSmtpPort}". Must be a valid TCP port.`
+    );
   }
 
   const smtpSecure = process.env.SMTP_SECURE?.trim().toLowerCase() === 'true';
   const smtpUser = process.env.SMTP_USER?.trim() || '';
   const smtpPass = process.env.SMTP_PASS?.trim() || '';
-  const smtpFrom = process.env.SMTP_FROM?.trim() || (smtpUser ? `GymOS <${smtpUser}>` : '');
+  const smtpFrom =
+    process.env.SMTP_FROM?.trim() || (smtpUser ? `GymOS <${smtpUser}>` : '');
   const emailConfigured = Boolean(smtpHost && smtpUser && smtpPass);
 
-  const whatsappAccessToken = process.env.WHATSAPP_CLOUD_ACCESS_TOKEN?.trim() || '';
-  const whatsappApiVersion = process.env.WHATSAPP_API_VERSION?.trim() || 'v20.0';
+  const whatsappAccessToken =
+    process.env.WHATSAPP_CLOUD_ACCESS_TOKEN?.trim() || '';
+  const whatsappApiVersion =
+    process.env.WHATSAPP_API_VERSION?.trim() || 'v20.0';
   const whatsappConfigured = Boolean(whatsappAccessToken);
 
-  const rawInterval = process.env.REMINDER_WORKER_INTERVAL_MINUTES?.trim() || '30';
+  const bootstrapToken = process.env.SUPER_ADMIN_BOOTSTRAP_TOKEN?.trim() || '';
+  const bootstrapEmail =
+    process.env.SUPER_ADMIN_BOOTSTRAP_EMAIL?.trim().toLowerCase() || '';
+  if (bootstrapEmail && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(bootstrapEmail)) {
+    throw new Error(
+      `Invalid SUPER_ADMIN_BOOTSTRAP_EMAIL "${bootstrapEmail}". Must be a valid email address.`
+    );
+  }
+
+  const rawInterval =
+    process.env.REMINDER_WORKER_INTERVAL_MINUTES?.trim() || '30';
   const reminderWorkerIntervalMinutes = Number(rawInterval);
-  if (!Number.isFinite(reminderWorkerIntervalMinutes) || reminderWorkerIntervalMinutes < 0) {
+  if (
+    !Number.isFinite(reminderWorkerIntervalMinutes) ||
+    reminderWorkerIntervalMinutes < 0
+  ) {
     throw new Error(
       `Invalid REMINDER_WORKER_INTERVAL_MINUTES "${rawInterval}". Must be a non-negative number.`
     );
@@ -122,10 +187,13 @@ function validateEnv(): ServerEnvConfig {
     }
   }
 
-  const hasGoogleAdc = Boolean(process.env.GOOGLE_APPLICATION_CREDENTIALS?.trim());
+  const hasGoogleAdc = Boolean(
+    process.env.GOOGLE_APPLICATION_CREDENTIALS?.trim()
+  );
 
   return {
     port,
+    host,
     appUrl: process.env.APP_URL?.trim() || `http://localhost:${port}`,
     smtpHost,
     smtpPort,
@@ -137,19 +205,13 @@ function validateEnv(): ServerEnvConfig {
     whatsappAccessToken,
     whatsappApiVersion,
     whatsappConfigured,
-    bootstrapToken: process.env.SUPER_ADMIN_BOOTSTRAP_TOKEN?.trim() || '',
+    bootstrapToken,
+    bootstrapEmail,
     cronSecret: process.env.CRON_SECRET?.trim() || '',
     reminderWorkerIntervalMinutes,
     serviceAccount,
     hasGoogleAdc,
   };
-}
-
-function timingSafeMatch(a: string, b: string): boolean {
-  if (!a || !b) return false;
-  const digestA = crypto.createHash('sha256').update(a).digest();
-  const digestB = crypto.createHash('sha256').update(b).digest();
-  return crypto.timingSafeEqual(digestA, digestB);
 }
 
 const env = validateEnv();
@@ -166,7 +228,8 @@ if (env.serviceAccount) {
         projectId: firebaseConfig.projectId,
       });
   adminDb =
-    firebaseConfig.firestoreDatabaseId && firebaseConfig.firestoreDatabaseId !== '(default)'
+    firebaseConfig.firestoreDatabaseId &&
+    firebaseConfig.firestoreDatabaseId !== '(default)'
       ? getFirestore(adminApp, firebaseConfig.firestoreDatabaseId)
       : getFirestore(adminApp);
 } else if (env.hasGoogleAdc) {
@@ -177,7 +240,8 @@ if (env.serviceAccount) {
         projectId: firebaseConfig.projectId,
       });
   adminDb =
-    firebaseConfig.firestoreDatabaseId && firebaseConfig.firestoreDatabaseId !== '(default)'
+    firebaseConfig.firestoreDatabaseId &&
+    firebaseConfig.firestoreDatabaseId !== '(default)'
       ? getFirestore(adminApp, firebaseConfig.firestoreDatabaseId)
       : getFirestore(adminApp);
 } else {
@@ -187,6 +251,7 @@ if (env.serviceAccount) {
 }
 
 const adminAuth: AdminAuth = getAuth(adminApp);
+const dbClient = adminDb as unknown as DbClient | null;
 
 const smtpTransporter = env.emailConfigured
   ? nodemailer.createTransport({
@@ -205,7 +270,12 @@ async function sendEmailReal(input: {
   subject: string;
   text: string;
   fromName?: string;
-}): Promise<{ delivered: boolean; providerMessageId?: string; sentAt?: string; errorDetails?: string }> {
+}): Promise<{
+  delivered: boolean;
+  providerMessageId?: string;
+  sentAt?: string;
+  errorDetails?: string;
+}> {
   if (!smtpTransporter || !env.smtpFrom) {
     return {
       delivered: false,
@@ -250,11 +320,17 @@ async function sendWhatsAppReal(input: {
   templateName?: string;
   templateParams?: string[];
   messageText: string;
-}): Promise<{ delivered: boolean; providerMessageId?: string; sentAt?: string; errorDetails?: string }> {
+}): Promise<{
+  delivered: boolean;
+  providerMessageId?: string;
+  sentAt?: string;
+  errorDetails?: string;
+}> {
   if (!env.whatsappConfigured) {
     return {
       delivered: false,
-      errorDetails: 'WHATSAPP_CLOUD_ACCESS_TOKEN is not configured on the server.',
+      errorDetails:
+        'WHATSAPP_CLOUD_ACCESS_TOKEN is not configured on the server.',
     };
   }
   const phoneNumberId = input.phoneNumberId?.trim();
@@ -319,7 +395,8 @@ async function sendWhatsAppReal(input: {
     if (!resp.ok) {
       return {
         delivered: false,
-        errorDetails: json?.error?.message || `WhatsApp Graph API HTTP ${resp.status}`,
+        errorDetails:
+          json?.error?.message || `WhatsApp Graph API HTTP ${resp.status}`,
       };
     }
     return {
@@ -330,122 +407,12 @@ async function sendWhatsAppReal(input: {
   } catch (err) {
     return {
       delivered: false,
-      errorDetails: err instanceof Error ? err.message : 'WhatsApp Cloud API request failed',
+      errorDetails:
+        err instanceof Error
+          ? err.message
+          : 'WhatsApp Cloud API request failed',
     };
   }
-}
-
-async function runPlatformReminderSweep(): Promise<{
-  skipped?: boolean;
-  reason?: string;
-  gymsProcessed: number;
-  retriesAttempted: number;
-  delivered: number;
-  failed: number;
-}> {
-  if (!adminDb) {
-    return {
-      skipped: true,
-      reason:
-        'Firebase Admin Firestore credentials (FIREBASE_SERVICE_ACCOUNT_JSON or GOOGLE_APPLICATION_CREDENTIALS) are not configured; scheduled server sweeps require Admin SDK credentials.',
-      gymsProcessed: 0,
-      retriesAttempted: 0,
-      delivered: 0,
-      failed: 0,
-    };
-  }
-
-  let gymsProcessed = 0;
-  let retriesAttempted = 0;
-  let delivered = 0;
-  let failed = 0;
-
-  const gymsSnap = await adminDb
-    .collection('gyms')
-    .where('accountStatus', '==', 'ACTIVE')
-    .get();
-
-  for (const gymDoc of gymsSnap.docs) {
-    const gym = gymDoc.data() as Record<string, unknown>;
-    const subStatus = String(gym.subscriptionStatus || '');
-    if (subStatus !== 'TRIAL' && subStatus !== 'ACTIVE') continue;
-
-    gymsProcessed += 1;
-    const settingsSnap = await gymDoc.ref.collection('settings').doc('default').get();
-    const settings = settingsSnap.exists ? (settingsSnap.data() as Record<string, unknown>) : {};
-
-    // Retry RETRY_SCHEDULED logs with retryCount < 3
-    const retryLogsSnap = await gymDoc.ref
-      .collection('notification_logs')
-      .where('deliveryStatus', '==', 'RETRY_SCHEDULED')
-      .limit(50)
-      .get();
-
-    for (const logDoc of retryLogsSnap.docs) {
-      const log = logDoc.data() as {
-        channel: string;
-        recipient: string;
-        memberName: string;
-        template: string;
-        retryCount: number;
-      };
-      if ((log.retryCount || 0) >= 3) continue;
-      retriesAttempted += 1;
-
-      const subject = `${String(gym.name || 'GymOS')} Reminder (${log.template.replace(/_/g, ' ')})`;
-      const message = `Hi ${log.memberName}, this is a reminder from ${String(gym.name || 'your gym')} (${log.template.replace(/_/g, ' ')}).`;
-
-      let outcome: {
-        delivered: boolean;
-        providerMessageId?: string;
-        sentAt?: string;
-        errorDetails?: string;
-      } = { delivered: false, errorDetails: 'Unsupported channel for retry' };
-
-      if (log.channel === 'EMAIL') {
-        outcome = await sendEmailReal({
-          to: log.recipient,
-          subject,
-          text: message,
-          fromName: String(settings.emailFromName || gym.name || 'GymOS'),
-        });
-      } else if (log.channel === 'WHATSAPP_CLOUD') {
-        outcome = await sendWhatsAppReal({
-          phone: log.recipient,
-          phoneNumberId: String(settings.whatsappPhoneNumberId || ''),
-          templateName: String(settings.whatsappApprovedTemplate || ''),
-          templateParams: [log.memberName, log.template.replace(/_/g, ' ')],
-          messageText: message,
-        });
-      }
-
-      const nextRetryCount = (log.retryCount || 0) + 1;
-      const nowIso = new Date().toISOString();
-      if (outcome.delivered) {
-        delivered += 1;
-        await logDoc.ref.update({
-          deliveryStatus: 'SENT',
-          retryCount: nextRetryCount,
-          errorDetails: '',
-          providerMessageId: outcome.providerMessageId || '',
-          sentAt: outcome.sentAt || nowIso,
-          lastAttemptAt: nowIso,
-          updatedAt: FieldValue.serverTimestamp(),
-        });
-      } else {
-        failed += 1;
-        await logDoc.ref.update({
-          deliveryStatus: nextRetryCount >= 3 ? 'FAILED' : 'RETRY_SCHEDULED',
-          retryCount: nextRetryCount,
-          errorDetails: (outcome.errorDetails || 'Delivery failed').slice(0, 400),
-          lastAttemptAt: nowIso,
-          updatedAt: FieldValue.serverTimestamp(),
-        });
-      }
-    }
-  }
-
-  return { gymsProcessed, retriesAttempted, delivered, failed };
 }
 
 async function verifyBearerUser(req: express.Request) {
@@ -461,9 +428,25 @@ async function verifyBearerUser(req: express.Request) {
   return decoded;
 }
 
+const rateLimiter = new SlidingWindowRateLimiter();
+const bootstrapController = new BootstrapController();
+const reminderWorker = new ReminderWorker({
+  db: dbClient,
+  sendEmail: sendEmailReal,
+  sendWhatsApp: sendWhatsAppReal,
+  serverTimestamp: () => FieldValue.serverTimestamp(),
+  intervalMinutes: env.reminderWorkerIntervalMinutes,
+  orderByField: 'id',
+});
+
 async function startServer() {
+  const bootstrapSyncPromise = dbClient
+    ? bootstrapController.syncFromDatabase(dbClient)
+    : Promise.resolve(false);
+
   const app = express();
   app.disable('x-powered-by');
+  app.set('trust proxy', 1);
   app.use(express.json({ limit: '512kb' }));
 
   app.use((_req, res, next) => {
@@ -481,26 +464,36 @@ async function startServer() {
         emailConfigured: env.emailConfigured,
         whatsappConfigured: env.whatsappConfigured,
         adminFirestoreConfigured: Boolean(adminDb),
-        adminBootstrapConfigured: Boolean(env.bootstrapToken),
+        adminBootstrapConfigured: bootstrapController.isWebBootstrapEnabled(
+          env.bootstrapToken,
+          env.bootstrapEmail
+        ),
+        bootstrapCompleted: bootstrapController.isCompleted,
         cronConfigured: Boolean(env.cronSecret),
       },
+      reminderWorker: reminderWorker.getStatus(),
     });
   });
 
-  app.get('/api/notifications/capabilities', (_req, res) => {
+  app.get('/api/notifications/capabilities', async (_req, res) => {
+    await bootstrapSyncPromise;
     res.status(200).json({
       emailConfigured: env.emailConfigured,
       whatsappConfigured: env.whatsappConfigured,
       adminFirestoreConfigured: Boolean(adminDb),
-      adminBootstrapConfigured: Boolean(env.bootstrapToken),
+      adminBootstrapConfigured: bootstrapController.isWebBootstrapEnabled(
+        env.bootstrapToken,
+        env.bootstrapEmail
+      ),
       cronConfigured: Boolean(env.cronSecret),
       smtpFrom: env.emailConfigured ? env.smtpFrom : '',
     });
   });
 
   app.post('/api/notifications/send', async (req, res) => {
+    let decoded;
     try {
-      await verifyBearerUser(req);
+      decoded = await verifyBearerUser(req);
     } catch (err) {
       res.status(401).json({
         delivered: false,
@@ -509,58 +502,57 @@ async function startServer() {
       return;
     }
 
-    const {
-      channel,
-      recipient,
-      subject,
-      message,
-      fromName,
-      whatsappPhoneNumberId,
-      whatsappApprovedTemplate,
-      whatsappTemplateParams,
-    } = (req.body || {}) as {
-      channel?: string;
-      recipient?: string;
-      subject?: string;
-      message?: string;
-      fromName?: string;
-      whatsappPhoneNumberId?: string;
-      whatsappApprovedTemplate?: string;
-      whatsappTemplateParams?: string[];
-    };
-
-    if (!message || typeof message !== 'string' || !message.trim()) {
-      res.status(400).json({ delivered: false, errorDetails: 'Message body is required.' });
+    let authorized;
+    try {
+      authorized = await authorizeAndResolveNotificationDispatch({
+        db: dbClient,
+        rateLimiter,
+        actor: {
+          uid: decoded.uid,
+          email: decoded.email || '',
+          emailVerified: decoded.email_verified === true,
+        },
+        body: (req.body || {}) as Record<string, unknown>,
+        serverTimestamp: () => FieldValue.serverTimestamp(),
+      });
+    } catch (err) {
+      if (err instanceof HttpError) {
+        res.status(err.status).json({
+          delivered: false,
+          code: err.code,
+          errorDetails: err.message,
+        });
+        return;
+      }
+      emitStructuredLog('error', 'notification-send', 'authorization_error', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      res.status(500).json({
+        delivered: false,
+        errorDetails: 'Failed to authorize notification request.',
+      });
       return;
     }
 
-    if (channel === 'EMAIL') {
+    if (authorized.channel === 'EMAIL') {
       const outcome = await sendEmailReal({
-        to: String(recipient || ''),
-        subject: String(subject || 'GymOS Reminder'),
-        text: message,
-        fromName,
+        to: authorized.recipient,
+        subject: authorized.subject,
+        text: authorized.message,
+        fromName: authorized.fromName,
       });
       res.status(200).json(outcome);
       return;
     }
 
-    if (channel === 'WHATSAPP_CLOUD') {
-      const outcome = await sendWhatsAppReal({
-        phone: String(recipient || ''),
-        phoneNumberId: whatsappPhoneNumberId,
-        templateName: whatsappApprovedTemplate,
-        templateParams: whatsappTemplateParams,
-        messageText: message,
-      });
-      res.status(200).json(outcome);
-      return;
-    }
-
-    res.status(400).json({
-      delivered: false,
-      errorDetails: `Unsupported delivery channel "${String(channel || '')}".`,
+    const outcome = await sendWhatsAppReal({
+      phone: authorized.recipient,
+      phoneNumberId: authorized.whatsappPhoneNumberId,
+      templateName: authorized.whatsappApprovedTemplate,
+      templateParams: authorized.whatsappTemplateParams,
+      messageText: authorized.message,
     });
+    res.status(200).json(outcome);
   });
 
   app.post('/api/admin/bootstrap', async (req, res) => {
@@ -575,116 +567,77 @@ async function startServer() {
       return;
     }
 
-    if (!env.bootstrapToken) {
-      res.status(403).json({
-        ok: false,
-        error:
-          'Super Admin web bootstrap is not enabled (SUPER_ADMIN_BOOTSTRAP_TOKEN is not set). Use scripts/init-super-admin.mjs or register an admin from an existing Super Admin account.',
-      });
-      return;
-    }
-
     const { bootstrapToken, displayName } = (req.body || {}) as {
       bootstrapToken?: string;
       displayName?: string;
     };
 
-    if (!bootstrapToken || !timingSafeMatch(String(bootstrapToken), env.bootstrapToken)) {
-      res.status(403).json({ ok: false, error: 'Invalid Super Admin bootstrap token.' });
-      return;
-    }
-
-    if (!adminDb) {
-      res.status(501).json({
-        ok: false,
-        error:
-          'Server-side Firestore credentials (FIREBASE_SERVICE_ACCOUNT_JSON or GOOGLE_APPLICATION_CREDENTIALS) are not configured in this environment. Run `node scripts/init-super-admin.mjs <email>` with credentials to initialize the first Super Admin.',
-      });
-      return;
-    }
-
     try {
-      const existingAdmins = await adminDb.collection('platform_admins').limit(2).get();
-      const callerAdminRef = adminDb.collection('platform_admins').doc(decoded.uid);
-      const callerIsAlreadyAdmin = (await callerAdminRef.get()).exists;
-
-      if (!existingAdmins.empty && !callerIsAlreadyAdmin) {
-        res.status(409).json({
+      await bootstrapSyncPromise;
+      const result = await bootstrapController.executeWebBootstrap({
+        db: dbClient,
+        rateLimiter,
+        clientIp: req.ip || req.socket.remoteAddress || 'unknown',
+        actor: {
+          uid: decoded.uid,
+          email: decoded.email || '',
+          emailVerified: decoded.email_verified === true,
+        },
+        displayName,
+        bootstrapToken,
+        configuredToken: env.bootstrapToken,
+        configuredEmail: env.bootstrapEmail,
+        serverTimestamp: () => FieldValue.serverTimestamp(),
+        onSuccessInvalidateSecrets: () => {
+          env.bootstrapToken = '';
+          env.bootstrapEmail = '';
+        },
+      });
+      res.status(200).json({ ok: true, uid: result.uid, email: result.email });
+    } catch (err) {
+      if (err instanceof HttpError) {
+        res.status(err.status).json({
           ok: false,
-          error:
-            'Platform Super Admin is already initialized. An existing Super Admin must authorize additional administrators.',
+          code: err.code,
+          error: err.message,
         });
         return;
       }
-
-      const resolvedName = (
-        displayName ||
-        decoded.name ||
-        decoded.email?.split('@')[0] ||
-        'Platform Admin'
-      )
-        .trim()
-        .slice(0, 120);
-      const resolvedEmail = (decoded.email || '').toLowerCase();
-
-      const batch = adminDb.batch();
-      batch.set(callerAdminRef, {
-        uid: decoded.uid,
-        email: resolvedEmail,
-        displayName: resolvedName,
-        createdAt: FieldValue.serverTimestamp(),
+      emitStructuredLog('error', 'admin-bootstrap', 'bootstrap_error', {
+        error: err instanceof Error ? err.message : String(err),
       });
-      batch.set(
-        adminDb.collection('users').doc(decoded.uid),
-        {
-          uid: decoded.uid,
-          email: resolvedEmail,
-          displayName: resolvedName,
-          role: 'SUPER_ADMIN',
-          status: 'ACTIVE',
-          createdAt: FieldValue.serverTimestamp(),
-          updatedAt: FieldValue.serverTimestamp(),
-        },
-        { merge: true }
-      );
-      const auditId = `aud_${crypto.randomBytes(8).toString('hex')}`;
-      batch.set(adminDb.collection('audit_logs').doc(auditId), {
-        id: auditId,
-        actorUid: decoded.uid,
-        actorEmail: resolvedEmail,
-        actorRole: 'SUPER_ADMIN',
-        action: 'BOOTSTRAP_SUPER_ADMIN',
-        entityType: 'PlatformAdmin',
-        entityId: decoded.uid,
-        summary: `Initialized platform Super Admin (${resolvedEmail}) via controlled bootstrap`,
-        createdAt: FieldValue.serverTimestamp(),
-      });
-
-      await batch.commit();
-      res.status(200).json({ ok: true, uid: decoded.uid, email: resolvedEmail });
-    } catch (err) {
       res.status(500).json({
         ok: false,
-        error: err instanceof Error ? err.message : 'Failed to initialize Super Admin.',
+        error:
+          err instanceof Error
+            ? err.message
+            : 'Failed to initialize Super Admin.',
       });
     }
   });
 
   app.post('/api/cron/reminders', async (req, res) => {
     if (!env.cronSecret) {
-      res.status(403).json({ ok: false, error: 'CRON_SECRET is not configured on the server.' });
+      res
+        .status(403)
+        .json({ ok: false, error: 'CRON_SECRET is not configured on the server.' });
       return;
     }
     const authHeader = req.headers.authorization || '';
     const match = /^Bearer\s+(.+)$/i.exec(authHeader);
     if (!match || !timingSafeMatch(match[1].trim(), env.cronSecret)) {
-      res.status(401).json({ ok: false, error: 'Invalid cron authorization token.' });
+      res
+        .status(401)
+        .json({ ok: false, error: 'Invalid cron authorization token.' });
       return;
     }
     try {
-      const result = await runPlatformReminderSweep();
+      const result = await reminderWorker.sweep();
       res.status(200).json({ ok: true, ...result });
     } catch (err) {
+      emitStructuredLog('error', 'cron-reminders', 'sweep_failed', {
+        error: err instanceof Error ? err.message : String(err),
+      });
       res.status(500).json({
         ok: false,
         error: err instanceof Error ? err.message : 'Cron sweep failed',
@@ -725,7 +678,9 @@ async function startServer() {
     );
     app.get('*', (_req, res) => {
       if (!fs.existsSync(indexFile)) {
-        res.status(503).send('Application bundle not built. Run npm run build first.');
+        res
+          .status(503)
+          .send('Application bundle not built. Run npm run build first.');
         return;
       }
       res.setHeader('Cache-Control', 'no-cache');
@@ -733,23 +688,47 @@ async function startServer() {
     });
   }
 
-  app.listen(env.port, '0.0.0.0', () => {
-    console.log(
-      `GymOS server listening on port ${env.port} (SMTP=${env.emailConfigured ? 'ready' : 'unconfigured'}, WhatsApp=${env.whatsappConfigured ? 'ready' : 'unconfigured'}, AdminFirestore=${adminDb ? 'ready' : 'disabled'})`
-    );
+  const httpServer = app.listen(env.port, env.host, () => {
+    emitStructuredLog('info', 'server', 'listening', {
+      port: env.port,
+      host: env.host,
+      emailConfigured: env.emailConfigured,
+      whatsappConfigured: env.whatsappConfigured,
+      adminFirestoreConfigured: Boolean(adminDb),
+      bootstrapEnabled: bootstrapController.isWebBootstrapEnabled(
+        env.bootstrapToken,
+        env.bootstrapEmail
+      ),
+      reminderWorkerIntervalMinutes: env.reminderWorkerIntervalMinutes,
+    });
   });
 
   if (adminDb && env.reminderWorkerIntervalMinutes > 0) {
-    const intervalMs = Math.round(env.reminderWorkerIntervalMinutes * 60 * 1000);
-    setInterval(() => {
-      runPlatformReminderSweep().catch((err) => {
-        console.error('[GymOS Reminder Worker] Sweep error:', err);
-      });
-    }, intervalMs);
+    reminderWorker.start();
   }
+
+  const shutdown = async (signal: string) => {
+    emitStructuredLog('info', 'server', 'shutdown_initiated', { signal });
+    await reminderWorker.stop();
+    await new Promise<void>((resolve) => {
+      httpServer.close(() => resolve());
+    });
+    process.exit(0);
+  };
+
+  process.once('SIGTERM', () => {
+    void shutdown('SIGTERM');
+  });
+  process.once('SIGINT', () => {
+    void shutdown('SIGINT');
+  });
 }
 
 startServer().catch((err) => {
-  console.error('Fatal server startup error:', err);
+  emitStructuredLog('error', 'server', 'fatal_startup_error', {
+    error: err instanceof Error ? err.message : String(err),
+  });
   process.exit(1);
 });
+
+export type _UnusedCryptoRef = typeof crypto;

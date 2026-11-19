@@ -26,6 +26,7 @@ export interface ReminderCandidate {
 }
 
 export const MAX_REMINDER_RETRIES = 3;
+export const RETRY_BACKOFF_MINUTES = [15, 60, 240] as const;
 
 export function buildDedupKey(
   memberId: string,
@@ -34,6 +35,44 @@ export function buildDedupKey(
   channel: ReminderChannel
 ): string {
   return `${memberId}__${template}__${scheduledDate}__${channel}`;
+}
+
+export function buildReminderLogId(dedupKey: string): string {
+  let h1 = 0x811c9dc5;
+  let h2 = 0x9e3779b9;
+  for (let i = 0; i < dedupKey.length; i++) {
+    const c = dedupKey.charCodeAt(i);
+    h1 ^= c;
+    h1 = Math.imul(h1, 0x01000193);
+    h2 ^= c + (i & 0xff);
+    h2 = Math.imul(h2, 0x85ebca6b);
+  }
+  const part1 = (h1 >>> 0).toString(16).padStart(8, '0');
+  const part2 = (h2 >>> 0).toString(16).padStart(8, '0');
+  return `nlog_${part1}${part2}`;
+}
+
+export function computeRetryBackoffMinutes(retryAttemptIndex: number): number {
+  const idx = Math.min(
+    Math.max(0, Math.floor(retryAttemptIndex)),
+    RETRY_BACKOFF_MINUTES.length - 1
+  );
+  return RETRY_BACKOFF_MINUTES[idx];
+}
+
+export function isRetryDue(
+  log: Pick<NotificationLog, 'deliveryStatus' | 'retryCount' | 'nextRetryAt'>,
+  nowIso: string
+): boolean {
+  if (log.deliveryStatus !== DeliveryStatus.RETRY_SCHEDULED) return false;
+  if ((log.retryCount || 0) >= MAX_REMINDER_RETRIES) return false;
+  if (!log.nextRetryAt) return true;
+  const dueMs = Date.parse(log.nextRetryAt);
+  const nowMs = Date.parse(nowIso);
+  if (Number.isFinite(dueMs) && Number.isFinite(nowMs)) {
+    return dueMs <= nowMs;
+  }
+  return log.nextRetryAt <= nowIso;
 }
 
 export function isWhatsAppReady(settings: GymSettings): boolean {
@@ -267,11 +306,13 @@ export function evaluateDueReminders(
 export function computeNextRetryState(
   currentLog: NotificationLog,
   deliverySucceeded: boolean,
-  errorMessage?: string
+  errorMessage?: string,
+  nowMs = Date.now()
 ): {
   canRetry: boolean;
   nextRetryCount: number;
   nextStatus: DeliveryStatus;
+  nextRetryAt: string;
   errorDetails?: string;
 } {
   if (currentLog.deliveryStatus === DeliveryStatus.SENT) {
@@ -279,6 +320,7 @@ export function computeNextRetryState(
       canRetry: false,
       nextRetryCount: currentLog.retryCount,
       nextStatus: DeliveryStatus.SENT,
+      nextRetryAt: '',
     };
   }
 
@@ -288,6 +330,7 @@ export function computeNextRetryState(
       canRetry: false,
       nextRetryCount: nextCount,
       nextStatus: DeliveryStatus.SENT,
+      nextRetryAt: '',
     };
   }
 
@@ -296,14 +339,19 @@ export function computeNextRetryState(
       canRetry: false,
       nextRetryCount: nextCount,
       nextStatus: DeliveryStatus.FAILED,
+      nextRetryAt: '',
       errorDetails: errorMessage || 'Maximum retries reached',
     };
   }
+
+  const backoffMinutes = computeRetryBackoffMinutes(nextCount);
+  const nextRetryAt = new Date(nowMs + backoffMinutes * 60_000).toISOString();
 
   return {
     canRetry: true,
     nextRetryCount: nextCount,
     nextStatus: DeliveryStatus.RETRY_SCHEDULED,
+    nextRetryAt,
     errorDetails: errorMessage || 'Delivery attempt failed; scheduled for retry',
   };
 }

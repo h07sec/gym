@@ -29,10 +29,14 @@ import {
 } from '../lib/domain/metrics';
 import {
   buildDedupKey,
+  buildReminderLogId,
   computeNextRetryState,
+  computeRetryBackoffMinutes,
   evaluateDueReminders,
+  isRetryDue,
   isWhatsAppReady,
   MAX_REMINDER_RETRIES,
+  RETRY_BACKOFF_MINUTES,
 } from '../lib/domain/reminders';
 import {
   computeEffectiveAccessEndIso,
@@ -954,7 +958,17 @@ describe('GymOS Reminder Automation, Deduplication, Opt-Out & CSV', () => {
     ).toBe(true);
   });
 
-  it('caps reminder retries at MAX_REMINDER_RETRIES and marks success/retry states accurately', () => {
+  it('caps reminder retries at MAX_REMINDER_RETRIES and computes exponential nextRetryAt backoff', () => {
+    expect(RETRY_BACKOFF_MINUTES).toEqual([15, 60, 240]);
+    expect(computeRetryBackoffMinutes(0)).toBe(15);
+    expect(computeRetryBackoffMinutes(1)).toBe(60);
+    expect(computeRetryBackoffMinutes(2)).toBe(240);
+
+    const key = buildDedupKey('m1', 'EXPIRING_TODAY', '2025-06-10', ReminderChannel.EMAIL);
+    expect(buildReminderLogId(key)).toBe(buildReminderLogId(key));
+    expect(buildReminderLogId(key)).toMatch(/^nlog_[0-9a-f]{16}$/);
+
+    const baseNow = Date.parse('2025-06-10T10:00:00.000Z');
     const maxedLog: NotificationLog = {
       id: 'l1',
       gymId: 'g1',
@@ -970,20 +984,32 @@ describe('GymOS Reminder Automation, Deduplication, Opt-Out & CSV', () => {
       createdAt: null,
       updatedAt: null,
     };
-    const nextMaxed = computeNextRetryState(maxedLog, false, 'SMTP timeout');
+    const nextMaxed = computeNextRetryState(maxedLog, false, 'SMTP timeout', baseNow);
     expect(nextMaxed.canRetry).toBe(false);
     expect(nextMaxed.nextStatus).toBe(DeliveryStatus.FAILED);
+    expect(nextMaxed.nextRetryAt).toBe('');
 
     const retryableLog: NotificationLog = { ...maxedLog, retryCount: 0 };
-    const nextRetry = computeNextRetryState(retryableLog, false, 'Temporary error');
-    expect(nextRetry.canRetry).toBe(true);
-    expect(nextRetry.nextRetryCount).toBe(1);
-    expect(nextRetry.nextStatus).toBe(DeliveryStatus.RETRY_SCHEDULED);
+    const nextRetry1 = computeNextRetryState(retryableLog, false, 'Temporary error', baseNow);
+    expect(nextRetry1.canRetry).toBe(true);
+    expect(nextRetry1.nextRetryCount).toBe(1);
+    expect(nextRetry1.nextStatus).toBe(DeliveryStatus.RETRY_SCHEDULED);
+    expect(nextRetry1.nextRetryAt).toBe('2025-06-10T11:00:00.000Z'); // +60m
 
-    const succeeded = computeNextRetryState(retryableLog, true);
+    const futureRetryLog: NotificationLog = {
+      ...retryableLog,
+      retryCount: 1,
+      nextRetryAt: nextRetry1.nextRetryAt,
+    };
+    expect(isRetryDue(futureRetryLog, '2025-06-10T10:30:00.000Z')).toBe(false);
+    expect(isRetryDue(futureRetryLog, '2025-06-10T11:00:00.000Z')).toBe(true);
+    expect(isRetryDue(maxedLog, '2025-06-10T11:00:00.000Z')).toBe(false);
+
+    const succeeded = computeNextRetryState(retryableLog, true, undefined, baseNow);
     expect(succeeded.canRetry).toBe(false);
     expect(succeeded.nextRetryCount).toBe(1);
     expect(succeeded.nextStatus).toBe(DeliveryStatus.SENT);
+    expect(succeeded.nextRetryAt).toBe('');
   });
 
   it('validates CSV rows, detects duplicate phones, and exports sanitized CSV', () => {

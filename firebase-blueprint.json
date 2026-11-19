@@ -415,6 +415,33 @@
         "createdAt": { "type": "string", "format": "date-time" }
       },
       "required": ["id", "actorUid", "actorEmail", "actorRole", "action", "entityType", "entityId", "summary", "createdAt"]
+    },
+    "PlatformBootstrap": {
+      "title": "PlatformBootstrap",
+      "description": "Server-only persistent one-time Super Admin bootstrap lock record.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 64 },
+        "completed": { "type": "boolean" },
+        "adminUid": { "type": "string", "maxLength": 128 },
+        "adminEmail": { "type": "string", "format": "email", "maxLength": 200 },
+        "method": { "type": "string", "enum": ["WEB_BOOTSTRAP", "CLI_BOOTSTRAP"] },
+        "completedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "completed", "adminUid", "adminEmail", "method", "completedAt"]
+    },
+    "SystemLock": {
+      "title": "SystemLock",
+      "description": "Server-only distributed worker lease and item claim lock.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "workerId": { "type": "string", "maxLength": 128 },
+        "released": { "type": "boolean" },
+        "expiresAtMs": { "type": "integer" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "workerId", "released", "expiresAtMs", "updatedAt"]
     }
   },
   "firestore": {
@@ -493,6 +520,14 @@
     "/audit_logs/{logId}": {
       "schema": { "$ref": "#/entities/AuditLog" },
       "description": "Immutable platform and tenant audit logs"
+    },
+    "/platform_bootstrap/{docId}": {
+      "schema": { "$ref": "#/entities/PlatformBootstrap" },
+      "description": "Server-only one-time bootstrap lock state"
+    },
+    "/system_locks/{lockId}": {
+      "schema": { "$ref": "#/entities/SystemLock" },
+      "description": "Server-only distributed worker leases and idempotency claims"
     }
   }
 }

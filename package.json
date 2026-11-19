@@ -11,8 +11,9 @@
     "clean": "rm -rf dist dist-server server.js",
     "lint": "tsc --noEmit",
     "lint:rules": "eslint firestore.rules",
-    "test": "vitest run src/tests/gymos-domain.test.ts src/tests/security-rules.test.ts",
-    "test:emulator": "firebase emulators:exec --only firestore \"npx vitest run src/tests/firestore.emulator.test.ts\""
+    "test": "vitest run src/tests/gymos-domain.test.ts src/tests/security-rules.test.ts src/tests/server-security.test.ts",
+    "test:emulator": "firebase emulators:exec --only firestore \"npx vitest run src/tests/firestore.emulator.test.ts\"",
+    "validate": "bun run lint && bun run lint:rules && bun run test && bun run build"
   },
   "dependencies": {
     "@firebase/eslint-plugin-security-rules": "^0.0.2",

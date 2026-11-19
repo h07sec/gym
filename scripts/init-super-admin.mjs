@@ -16,6 +16,14 @@ async function main() {
     process.exit(1);
   }
 
+  const allowlistedEmail = process.env.SUPER_ADMIN_BOOTSTRAP_EMAIL?.trim().toLowerCase();
+  if (allowlistedEmail && allowlistedEmail !== emailArg) {
+    console.error(
+      `Email "${emailArg}" does not match configured SUPER_ADMIN_BOOTSTRAP_EMAIL ("${allowlistedEmail}").`
+    );
+    process.exit(1);
+  }
+
   const configPath = path.resolve(process.cwd(), 'firebase-applet-config.json');
   if (!fs.existsSync(configPath)) {
     console.error(`Missing ${configPath}`);
@@ -49,48 +57,79 @@ async function main() {
       : getFirestore(app);
 
   const userRecord = await auth.getUserByEmail(emailArg);
+  if (!userRecord.emailVerified) {
+    console.error(`User "${emailArg}" must have a verified email before Super Admin initialization.`);
+    process.exit(1);
+  }
+
   const resolvedName =
     displayNameArg || userRecord.displayName || emailArg.split('@')[0] || 'Platform Admin';
 
-  const batch = db.batch();
-  batch.set(db.collection('platform_admins').doc(userRecord.uid), {
-    uid: userRecord.uid,
-    email: emailArg,
-    displayName: resolvedName,
-    createdAt: FieldValue.serverTimestamp(),
-  });
-  batch.set(
-    db.collection('users').doc(userRecord.uid),
-    {
+  await db.runTransaction(async (tx) => {
+    const lockRef = db.collection('platform_bootstrap').doc('default');
+    const adminsQuery = db.collection('platform_admins').limit(1);
+    const [lockSnap, adminsSnap] = await Promise.all([
+      tx.get(lockRef),
+      tx.get(adminsQuery),
+    ]);
+
+    if (
+      (lockSnap.exists && lockSnap.data()?.completed === true) ||
+      !adminsSnap.empty
+    ) {
+      throw new Error(
+        'Platform Super Admin bootstrap is already completed. Add additional admins from /admin -> Platform Settings.'
+      );
+    }
+
+    tx.set(lockRef, {
+      id: 'default',
+      completed: true,
+      adminUid: userRecord.uid,
+      adminEmail: emailArg,
+      method: 'CLI_BOOTSTRAP',
+      completedAt: FieldValue.serverTimestamp(),
+    });
+
+    tx.set(db.collection('platform_admins').doc(userRecord.uid), {
       uid: userRecord.uid,
       email: emailArg,
       displayName: resolvedName,
-      role: 'SUPER_ADMIN',
-      status: 'ACTIVE',
       createdAt: FieldValue.serverTimestamp(),
-      updatedAt: FieldValue.serverTimestamp(),
-    },
-    { merge: true }
-  );
+    });
 
-  const auditId = `aud_${crypto.randomBytes(8).toString('hex')}`;
-  batch.set(db.collection('audit_logs').doc(auditId), {
-    id: auditId,
-    actorUid: userRecord.uid,
-    actorEmail: emailArg,
-    actorRole: 'SUPER_ADMIN',
-    action: 'CLI_INIT_SUPER_ADMIN',
-    entityType: 'PlatformAdmin',
-    entityId: userRecord.uid,
-    summary: `Initialized platform Super Admin (${emailArg}) via CLI`,
-    createdAt: FieldValue.serverTimestamp(),
+    tx.set(
+      db.collection('users').doc(userRecord.uid),
+      {
+        uid: userRecord.uid,
+        email: emailArg,
+        displayName: resolvedName,
+        role: 'SUPER_ADMIN',
+        status: 'ACTIVE',
+        createdAt: FieldValue.serverTimestamp(),
+        updatedAt: FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+
+    const auditId = `aud_${crypto.randomBytes(8).toString('hex')}`;
+    tx.set(db.collection('audit_logs').doc(auditId), {
+      id: auditId,
+      actorUid: userRecord.uid,
+      actorEmail: emailArg,
+      actorRole: 'SUPER_ADMIN',
+      action: 'CLI_INIT_SUPER_ADMIN',
+      entityType: 'PlatformBootstrap',
+      entityId: 'default',
+      summary: `Initialized initial platform Super Admin (${emailArg}) via atomic CLI bootstrap`,
+      createdAt: FieldValue.serverTimestamp(),
+    });
   });
 
-  await batch.commit();
-  console.log(`Initialized Super Admin: ${emailArg} (uid=${userRecord.uid})`);
+  console.log(`Initialized Super Admin: ${emailArg} (uid=${userRecord.uid}). One-time bootstrap is now locked.`);
 }
 
 main().catch((err) => {
-  console.error('Failed to initialize Super Admin:', err);
+  console.error('Failed to initialize Super Admin:', err instanceof Error ? err.message : err);
   process.exit(1);
 });

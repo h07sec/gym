@@ -266,7 +266,7 @@ export const RemindersView: React.FC<RemindersViewProps> = ({
               <p className="text-slate-500 mt-0.5">
                 {capabilities.whatsappConfigured
                   ? 'Meta Cloud API token is configured; add your Phone Number ID & approved template below.'
-                  : 'Set WHATSAPP_ACCESS_TOKEN on the server and configure Phone Number ID & template below.'}
+                  : 'Set WHATSAPP_CLOUD_ACCESS_TOKEN on the server and configure Phone Number ID & template below.'}
               </p>
             </div>
           </div>

@@ -625,5 +625,24 @@ describe('Firestore Emulator Security Rules Integration Suite', () => {
     await assertFails(deleteDoc(doc(ownerADb, 'gyms', 'gym_a', 'payment_receipts', 'rcp_a1')));
     await assertFails(updateDoc(doc(ownerADb, 'audit_logs', 'aud_1'), { summary: 'Tampered' }));
     await assertFails(deleteDoc(doc(ownerADb, 'audit_logs', 'aud_1')));
+
+    // Server-only bootstrap and worker lock collections deny all client SDK reads & writes
+    const adminDb = testEnv
+      .authenticatedContext('admin_1', { email: 'admin@gymos.test', email_verified: true })
+      .firestore();
+    await assertFails(getDoc(doc(adminDb, 'platform_bootstrap', 'default')));
+    await assertFails(
+      setDoc(doc(adminDb, 'platform_bootstrap', 'default'), {
+        id: 'default',
+        completed: false,
+      })
+    );
+    await assertFails(getDoc(doc(adminDb, 'system_locks', 'reminder_worker')));
+    await assertFails(
+      setDoc(doc(ownerADb, 'system_locks', 'reminder_worker'), {
+        id: 'reminder_worker',
+        released: true,
+      })
+    );
   });
 });

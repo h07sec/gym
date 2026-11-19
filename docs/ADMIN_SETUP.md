@@ -13,12 +13,12 @@ Regular users and gym owners cannot create `/platform_admins/{uid}` records or a
    ```bash
    node scripts/init-super-admin.mjs admin@yourdomain.com "Platform Admin"
    ```
-   This atomically writes `/platform_admins/{uid}`, `/users/{uid}` (`role: 'SUPER_ADMIN'`), and an immutable `CLI_INIT_SUPER_ADMIN` audit log entry.
+   This runs a Firestore transaction that sets `/platform_bootstrap/default` (`completed: true`), `/platform_admins/{uid}`, `/users/{uid}` (`role: 'SUPER_ADMIN'`), and an immutable `CLI_INIT_SUPER_ADMIN` audit log entry.
 
 ### Option B: Web Bootstrap Endpoint (`POST /api/admin/bootstrap`)
-1. Set a high-entropy one-time token in `SUPER_ADMIN_BOOTSTRAP_TOKEN` and configure `FIREBASE_SERVICE_ACCOUNT_JSON` (or `GOOGLE_APPLICATION_CREDENTIALS`) on the server.
-2. Open `/admin`, sign in with your verified Google account, and enter the bootstrap token when prompted.
-3. Once the first Super Admin exists in `/platform_admins`, `POST /api/admin/bootstrap` automatically locks (`HTTP 409`) so no unauthorized caller can reuse the token. Remove `SUPER_ADMIN_BOOTSTRAP_TOKEN` from `.env` afterward.
+1. Set both a high-entropy one-time token in `SUPER_ADMIN_BOOTSTRAP_TOKEN` and the exact initial administrator email in `SUPER_ADMIN_BOOTSTRAP_EMAIL`, alongside `FIREBASE_SERVICE_ACCOUNT_JSON` (or `GOOGLE_APPLICATION_CREDENTIALS`).
+2. Open `/admin`, sign in with the verified Google account matching `SUPER_ADMIN_BOOTSTRAP_EMAIL`, and enter the bootstrap token when prompted.
+3. On success, the server atomically creates `/platform_bootstrap/default` (`completed: true`), `/platform_admins/{uid}`, `/users/{uid}`, and an audit log, **immediately invalidates the in-memory bootstrap token & email**, and rejects all subsequent or concurrent attempts (`HTTP 409`). Remove both `SUPER_ADMIN_BOOTSTRAP_*` variables from `.env` afterward.
 
 ## 2. Managing Additional Super Admins
 

@@ -183,9 +183,9 @@ describe('Firestore Security Rules Structural & Multi-Tenant Verification', () =
     expect(ops.delete).toBe('false');
   });
 
-  it('covers all 19 collections in firebase-blueprint.json with explicit CRUD clauses', () => {
+  it('covers all 21 collections in firebase-blueprint.json with explicit CRUD clauses', () => {
     const blueprintPaths = Object.keys(blueprint.firestore);
-    expect(blueprintPaths).toHaveLength(19);
+    expect(blueprintPaths).toHaveLength(21);
 
     for (const collectionPath of blueprintPaths) {
       const block = blockMap.get(collectionPath);
@@ -196,6 +196,15 @@ describe('Firestore Security Rules Structural & Multi-Tenant Verification', () =
       expect(ops.create.length, `${collectionPath} missing allow create/write`).toBeGreaterThan(0);
       expect(ops.update.length, `${collectionPath} missing allow update/write`).toBeGreaterThan(0);
       expect(ops.delete.length, `${collectionPath} missing allow delete/write`).toBeGreaterThan(0);
+    }
+
+    for (const serverOnlyPath of ['/platform_bootstrap/{docId}', '/system_locks/{lockId}']) {
+      const ops = getOpsFor(serverOnlyPath);
+      expect(ops.get).toBe('false');
+      expect(ops.list).toBe('false');
+      expect(ops.create).toBe('false');
+      expect(ops.update).toBe('false');
+      expect(ops.delete).toBe('false');
     }
   });
 
