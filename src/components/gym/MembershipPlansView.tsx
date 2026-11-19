@@ -15,6 +15,7 @@ import {
 import { formatCurrency } from '../../lib/utils';
 import { StatusLabel } from '../common/StatusBadge';
 import { Modal } from '../common/Modal';
+import { ConfirmModal } from '../common/ConfirmModal';
 
 interface MembershipPlansViewProps {
   actor: ActorContext;
@@ -35,13 +36,18 @@ export const MembershipPlansView: React.FC<MembershipPlansViewProps> = ({
   const canManage =
     actor.role === UserRole.GYM_OWNER ||
     actor.role === UserRole.GYM_MANAGER ||
+    actor.role === UserRole.SUPER_ADMIN ||
     permissions.canManagePlans;
 
   const [editing, setEditing] = useState<Partial<MembershipPlan> | null>(null);
+  const [deletingPlan, setDeletingPlan] = useState<MembershipPlan | null>(null);
   const [benefitsText, setBenefitsText] = useState('');
   const [busy, setBusy] = useState(false);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [feedback, setFeedback] = useState<string | null>(null);
 
   const openNew = () => {
+    setErrorMsg(null);
     setEditing({
       name: '',
       durationType: MembershipDurationType.MONTHLY,
@@ -54,6 +60,7 @@ export const MembershipPlansView: React.FC<MembershipPlansViewProps> = ({
   };
 
   const openEdit = (p: MembershipPlan) => {
+    setErrorMsg(null);
     setEditing(p);
     setBenefitsText(p.benefits.join('\n'));
   };
@@ -62,6 +69,7 @@ export const MembershipPlansView: React.FC<MembershipPlansViewProps> = ({
     e.preventDefault();
     if (!editing) return;
     setBusy(true);
+    setErrorMsg(null);
     try {
       await saveMembershipPlan(actor, gymId, {
         id: editing.id,
@@ -77,6 +85,25 @@ export const MembershipPlansView: React.FC<MembershipPlansViewProps> = ({
         status: (editing.status as 'ACTIVE' | 'INACTIVE') || 'ACTIVE',
       });
       setEditing(null);
+      setFeedback('Membership plan saved.');
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : 'Failed to save membership plan.');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleConfirmDelete = async () => {
+    if (!deletingPlan) return;
+    setBusy(true);
+    setErrorMsg(null);
+    try {
+      await deleteMembershipPlan(actor, gymId, deletingPlan);
+      setFeedback(`Deleted plan "${deletingPlan.name}".`);
+      setDeletingPlan(null);
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : 'Cannot delete this plan.');
+      setDeletingPlan(null);
     } finally {
       setBusy(false);
     }
@@ -102,6 +129,23 @@ export const MembershipPlansView: React.FC<MembershipPlansViewProps> = ({
           </button>
         )}
       </div>
+
+      {feedback && (
+        <div className="px-4 py-2.5 bg-emerald-50 border border-emerald-200 rounded-md text-xs text-emerald-800 flex items-center justify-between">
+          <span>{feedback}</span>
+          <button type="button" onClick={() => setFeedback(null)} className="font-semibold cursor-pointer">
+            Dismiss
+          </button>
+        </div>
+      )}
+      {errorMsg && (
+        <div className="px-4 py-2.5 bg-red-50 border border-red-200 rounded-md text-xs text-red-700 flex items-center justify-between">
+          <span>{errorMsg}</span>
+          <button type="button" onClick={() => setErrorMsg(null)} className="font-semibold cursor-pointer">
+            Dismiss
+          </button>
+        </div>
+      )}
 
       {plans.length === 0 ? (
         <div className="bg-white border border-slate-200 rounded-lg p-10 text-center space-y-2">
@@ -162,7 +206,7 @@ export const MembershipPlansView: React.FC<MembershipPlansViewProps> = ({
                     actor.role === UserRole.SUPER_ADMIN) && (
                     <button
                       type="button"
-                      onClick={() => deleteMembershipPlan(actor, gymId, p)}
+                      onClick={() => setDeletingPlan(p)}
                       className="p-1.5 text-red-600 border border-slate-200 rounded-md hover:bg-red-50 cursor-pointer"
                       title="Delete plan"
                     >
@@ -175,6 +219,16 @@ export const MembershipPlansView: React.FC<MembershipPlansViewProps> = ({
           ))}
         </div>
       )}
+
+      <ConfirmModal
+        open={Boolean(deletingPlan)}
+        title={`Delete Plan "${deletingPlan?.name}"`}
+        description="Plans assigned to active members or referenced in historical memberships cannot be deleted; mark them INACTIVE instead. Proceed to delete this unused plan?"
+        confirmLabel="Delete Plan"
+        variant="danger"
+        onConfirm={handleConfirmDelete}
+        onCancel={() => setDeletingPlan(null)}
+      />
 
       <Modal
         open={Boolean(editing)}

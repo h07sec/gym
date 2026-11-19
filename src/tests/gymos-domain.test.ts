@@ -7,16 +7,25 @@ import {
   deriveMemberMembershipStatus,
 } from '../lib/domain/dates';
 import {
+  calculateNetPlanAmount,
   calculateOutstandingAfterPayment,
   canStaffConfirmPayment,
+  canStaffRecordPayment,
+  canStaffViewPayments,
+  deriveMemberPaymentDisplayStatus,
   isDuplicateUpiReference,
+  isPotentialDuplicateCashPayment,
   validatePaymentConfirmationTransition,
 } from '../lib/domain/payments';
 import {
   computeDailyReport,
+  computeDateRangeReport,
+  computeExpiringMembershipsReport,
   computeGymDashboardMetrics,
   computeMonthlyReport,
+  computeOutstandingBalancesReport,
   computePlatformOverview,
+  computeWeeklyReport,
 } from '../lib/domain/metrics';
 import {
   buildDedupKey,
@@ -25,6 +34,10 @@ import {
   isWhatsAppReady,
   MAX_REMINDER_RETRIES,
 } from '../lib/domain/reminders';
+import {
+  computeEffectiveAccessEndIso,
+  evaluateGymSubscriptionAccess,
+} from '../lib/domain/subscription';
 import {
   exportMembersToCsv,
   parseAndValidateMemberCsv,
@@ -36,6 +49,7 @@ import {
   GymSettings,
   Member,
   MemberPayment,
+  MemberPaymentDisplayStatus,
   MemberPaymentPurpose,
   MemberPaymentStatus,
   Membership,
@@ -45,8 +59,10 @@ import {
   MembershipStatus,
   NotificationLog,
   PaymentMode,
+  ReminderCategory,
   ReminderChannel,
   RenewalPolicy,
+  StaffPermissions,
   SubscriptionPayment,
   SubscriptionPaymentStatus,
   SubscriptionPlan,
@@ -210,26 +226,145 @@ describe('GymOS Manual Cash/UPI Payments & RBAC Verification', () => {
     expect(calculateOutstandingAfterPayment(500, 1000, MemberPaymentPurpose.ADVANCE)).toBe(0);
   });
 
-  it('enforces payment confirmation authority by role and staff permission', () => {
+  it('enforces payment recording, viewing, and confirmation authority by role and 8-key permissions', () => {
+    const basePerms: StaffPermissions = {
+      canViewReports: false,
+      canViewPayments: false,
+      canRecordPayments: false,
+      canManagePlans: false,
+      canConfirmPayments: false,
+      canDeleteMembers: false,
+      canManageReminders: false,
+      canManageAttendance: false,
+    };
+
     expect(canStaffConfirmPayment(UserRole.GYM_OWNER, null)).toBe(true);
+    expect(canStaffConfirmPayment(UserRole.GYM_RECEPTIONIST, basePerms)).toBe(false);
     expect(
       canStaffConfirmPayment(UserRole.GYM_RECEPTIONIST, {
-        canViewReports: false,
-        canManagePlans: false,
-        canConfirmPayments: false,
-        canDeleteMembers: false,
-        canManageReminders: false,
-      })
-    ).toBe(false);
-    expect(
-      canStaffConfirmPayment(UserRole.GYM_RECEPTIONIST, {
-        canViewReports: false,
-        canManagePlans: false,
+        ...basePerms,
         canConfirmPayments: true,
-        canDeleteMembers: false,
-        canManageReminders: false,
       })
     ).toBe(true);
+
+    expect(canStaffRecordPayment(UserRole.GYM_OWNER, null)).toBe(true);
+    expect(canStaffRecordPayment(UserRole.GYM_MANAGER, basePerms)).toBe(true);
+    expect(canStaffRecordPayment(UserRole.GYM_TRAINER, basePerms)).toBe(false);
+    expect(
+      canStaffRecordPayment(UserRole.GYM_TRAINER, {
+        ...basePerms,
+        canRecordPayments: true,
+      })
+    ).toBe(true);
+
+    expect(canStaffViewPayments(UserRole.GYM_TRAINER, basePerms)).toBe(false);
+    expect(
+      canStaffViewPayments(UserRole.GYM_TRAINER, {
+        ...basePerms,
+        canViewPayments: true,
+      })
+    ).toBe(true);
+    expect(
+      canStaffViewPayments(UserRole.GYM_RECEPTIONIST, {
+        ...basePerms,
+        canViewPayments: false,
+        canRecordPayments: true,
+      })
+    ).toBe(true);
+  });
+
+  it('calculates net plan amounts, detects duplicate cash payments, and derives payment display statuses', () => {
+    expect(calculateNetPlanAmount(2500, 300)).toEqual({
+      grossPrice: 2500,
+      discount: 300,
+      netPrice: 2200,
+    });
+    expect(calculateNetPlanAmount(1000, 1500)).toEqual({
+      grossPrice: 1000,
+      discount: 1000,
+      netPrice: 0,
+    });
+
+    const cashPayment: MemberPayment = {
+      ...basePayment,
+      id: 'pay_cash_1',
+      paymentMode: PaymentMode.CASH,
+      transactionReference: undefined,
+      amount: 1500,
+      paymentDate: '2025-06-10',
+      status: MemberPaymentStatus.CONFIRMED,
+    };
+    expect(isPotentialDuplicateCashPayment([cashPayment], 'mem_1', 1500, '2025-06-10')).toBe(true);
+    expect(isPotentialDuplicateCashPayment([cashPayment], 'mem_1', 1500, '2025-06-11')).toBe(false);
+    expect(
+      isPotentialDuplicateCashPayment(
+        [{ ...cashPayment, status: MemberPaymentStatus.REJECTED }],
+        'mem_1',
+        1500,
+        '2025-06-10'
+      )
+    ).toBe(false);
+
+    const member: Member = {
+      id: 'mem_1',
+      gymId: 'gym_a',
+      memberCode: 'M-001',
+      fullName: 'Aarav Mehta',
+      phone: '9876543210',
+      joiningDate: '2025-06-01',
+      membershipExpiryDate: '2025-07-01',
+      membershipStatus: MembershipStatus.ACTIVE,
+      outstandingBalance: 1000,
+      reminderOptOut: false,
+      isArchived: false,
+      createdAt: null,
+      updatedAt: null,
+    };
+    const membership: Membership = {
+      id: 'ms_1',
+      gymId: 'gym_a',
+      memberId: 'mem_1',
+      memberName: 'Aarav Mehta',
+      planId: 'plan_1',
+      planName: 'Monthly',
+      actionType: MembershipActionType.INITIAL,
+      startDate: '2025-06-01',
+      expiryDate: '2025-07-01',
+      planPrice: 2000,
+      amountPaid: 1000,
+      balanceDue: 1000,
+      dueDate: '2025-06-15',
+      status: MembershipRecordStatus.ACTIVE,
+      recordedByUid: 'u1',
+      createdAt: null,
+      updatedAt: null,
+    };
+
+    expect(
+      deriveMemberPaymentDisplayStatus(member, [basePayment], [membership], '2025-06-10')
+    ).toBe(MemberPaymentDisplayStatus.PENDING_VERIFICATION);
+    expect(
+      deriveMemberPaymentDisplayStatus(
+        { ...member, outstandingBalance: 0 },
+        [],
+        [membership],
+        '2025-06-10'
+      )
+    ).toBe(MemberPaymentDisplayStatus.PAID);
+    expect(
+      deriveMemberPaymentDisplayStatus(member, [], [membership], '2025-06-10')
+    ).toBe(MemberPaymentDisplayStatus.PARTIALLY_PAID);
+    expect(
+      deriveMemberPaymentDisplayStatus(member, [], [membership], '2025-06-18')
+    ).toBe(MemberPaymentDisplayStatus.OVERDUE);
+    expect(
+      deriveMemberPaymentDisplayStatus(
+        member,
+        [],
+        [{ ...membership, amountPaid: 0 }],
+        '2025-06-10'
+      )
+    ).toBe(MemberPaymentDisplayStatus.UNPAID);
   });
 });
 
@@ -482,6 +617,107 @@ describe('GymOS Real Dashboard & Platform Metrics', () => {
     expect(overview.monthlyRecurringRevenue).toBe(1000);
     expect(overview.verifiedSubscriptionCollections).toBe(3000);
   });
+
+  it('computes weekly, custom date-range, outstanding balances, and expiring membership reports', () => {
+    const dueMemberships: Membership[] = [
+      ...memberships,
+      {
+        id: 'ms2',
+        gymId: 'g1',
+        memberId: 'm1',
+        memberName: 'Active Member',
+        planId: 'pl1',
+        planName: 'Monthly Pro',
+        actionType: MembershipActionType.INITIAL,
+        startDate: '2025-06-02',
+        expiryDate: '2025-07-02',
+        planPrice: 2000,
+        amountPaid: 1500,
+        balanceDue: 500,
+        dueDate: '2025-06-05',
+        status: MembershipRecordStatus.ACTIVE,
+        recordedByUid: 'u1',
+        createdAt: null,
+        updatedAt: null,
+      },
+    ];
+
+    const weekly = computeWeeklyReport(members, payments, dueMemberships, '2025-06-10');
+    expect(weekly.startDate).toBe('2025-06-04');
+    expect(weekly.endDate).toBe('2025-06-10');
+    expect(weekly.totalRevenue).toBe(1500);
+    expect(weekly.pendingPaymentsCount).toBe(1);
+
+    const range = computeDateRangeReport(
+      members,
+      payments,
+      dueMemberships,
+      '2025-06-01',
+      '2025-06-10'
+    );
+    expect(range.totalRevenue).toBe(2500);
+    expect(range.cashRevenue).toBe(1500);
+    expect(range.upiRevenue).toBe(1000);
+    expect(range.newMembers).toBe(1);
+    expect(range.renewals).toBe(1);
+
+    const outstanding = computeOutstandingBalancesReport(members, dueMemberships, '2025-06-10');
+    expect(outstanding).toHaveLength(1);
+    expect(outstanding[0].memberId).toBe('m1');
+    expect(outstanding[0].outstandingBalance).toBe(500);
+    expect(outstanding[0].daysOverdue).toBe(5);
+
+    const expiring = computeExpiringMembershipsReport(members, '2025-06-10', 14);
+    expect(expiring.some((row) => row.memberId === 'm2' && row.daysRemaining === 2)).toBe(true);
+    expect(expiring.some((row) => row.memberId === 'm1')).toBe(false);
+  });
+});
+
+describe('GymOS Subscription Access & Grace Period Enforcement', () => {
+  const baseGym = {
+    accountStatus: AccountStatus.ACTIVE,
+    subscriptionStatus: SubscriptionStatus.ACTIVE,
+    subscriptionEndAt: '2025-06-10',
+    gracePeriodDays: 7,
+  };
+
+  it('computes effective access date and detects grace period vs expired lock', () => {
+    expect(computeEffectiveAccessEndIso('2025-06-10T00:00:00Z', 7)).toBe('2025-06-17');
+
+    const active = evaluateGymSubscriptionAccess(baseGym, '2025-06-05');
+    expect(active.isLocked).toBe(false);
+    expect(active.inGracePeriod).toBe(false);
+
+    const inGrace = evaluateGymSubscriptionAccess(baseGym, '2025-06-15');
+    expect(inGrace.isLocked).toBe(false);
+    expect(inGrace.inGracePeriod).toBe(true);
+    expect(inGrace.reason).toBe('ACTIVE');
+
+    const pastGrace = evaluateGymSubscriptionAccess(baseGym, '2025-06-18');
+    expect(pastGrace.isLocked).toBe(true);
+    expect(pastGrace.reason).toBe('EXPIRED');
+
+    const suspended = evaluateGymSubscriptionAccess(
+      { ...baseGym, accountStatus: AccountStatus.SUSPENDED },
+      '2025-06-05'
+    );
+    expect(suspended.isLocked).toBe(true);
+    expect(suspended.reason).toBe('SUSPENDED');
+
+    const pending = evaluateGymSubscriptionAccess(
+      { ...baseGym, subscriptionStatus: SubscriptionStatus.PENDING },
+      '2025-06-05'
+    );
+    expect(pending.isLocked).toBe(true);
+    expect(pending.reason).toBe('PENDING_VERIFICATION');
+
+    const cancelled = evaluateGymSubscriptionAccess(
+      { ...baseGym, subscriptionStatus: SubscriptionStatus.CANCELLED },
+      '2025-06-05'
+    );
+    expect(cancelled.isLocked).toBe(true);
+    expect(cancelled.reason).toBe('CANCELLED');
+  });
 });
 
 describe('GymOS Reminder Automation, Deduplication, Opt-Out & CSV', () => {
@@ -584,8 +820,142 @@ describe('GymOS Reminder Automation, Deduplication, Opt-Out & CSV', () => {
     ).toBe(true);
   });
 
-  it('caps reminder retries at MAX_REMINDER_RETRIES', () => {
-    const log: NotificationLog = {
+  it('evaluates upcoming/overdue payment reminders and gym owner subscription expiry alerts', () => {
+    const members: Member[] = [
+      {
+        id: 'm_due',
+        gymId: 'g1',
+        memberCode: 'GYM-10',
+        fullName: 'Vikram Rao',
+        phone: '9988776655',
+        email: 'vikram@example.com',
+        joiningDate: '2025-06-01',
+        membershipExpiryDate: '2025-07-01',
+        membershipStatus: MembershipStatus.ACTIVE,
+        outstandingBalance: 1200,
+        reminderOptOut: false,
+        isArchived: false,
+        createdAt: null,
+        updatedAt: null,
+      },
+      {
+        id: 'm_overdue',
+        gymId: 'g1',
+        memberCode: 'GYM-11',
+        fullName: 'Sneha Nair',
+        phone: '9988776644',
+        email: 'sneha@example.com',
+        joiningDate: '2025-05-01',
+        membershipExpiryDate: '2025-06-01',
+        membershipStatus: MembershipStatus.EXPIRED,
+        outstandingBalance: 800,
+        reminderOptOut: false,
+        isArchived: false,
+        createdAt: null,
+        updatedAt: null,
+      },
+    ];
+    const memberships: Membership[] = [
+      {
+        id: 'ms_due',
+        gymId: 'g1',
+        memberId: 'm_due',
+        memberName: 'Vikram Rao',
+        planId: 'p1',
+        planName: 'Monthly',
+        actionType: MembershipActionType.INITIAL,
+        startDate: '2025-06-01',
+        expiryDate: '2025-07-01',
+        planPrice: 2000,
+        amountPaid: 800,
+        balanceDue: 1200,
+        dueDate: '2025-06-12',
+        status: MembershipRecordStatus.ACTIVE,
+        recordedByUid: 'u1',
+        createdAt: null,
+        updatedAt: null,
+      },
+      {
+        id: 'ms_overdue',
+        gymId: 'g1',
+        memberId: 'm_overdue',
+        memberName: 'Sneha Nair',
+        planId: 'p1',
+        planName: 'Monthly',
+        actionType: MembershipActionType.INITIAL,
+        startDate: '2025-05-01',
+        expiryDate: '2025-06-01',
+        planPrice: 1500,
+        amountPaid: 700,
+        balanceDue: 800,
+        dueDate: '2025-06-07',
+        status: MembershipRecordStatus.ACTIVE,
+        recordedByUid: 'u1',
+        createdAt: null,
+        updatedAt: null,
+      },
+    ];
+    const gym: Gym = {
+      id: 'g1',
+      name: 'Pulse Athletics',
+      ownerUid: 'owner_1',
+      ownerName: 'Arjun',
+      email: 'arjun@pulse.test',
+      phone: '9876543210',
+      accountStatus: AccountStatus.ACTIVE,
+      subscriptionStatus: SubscriptionStatus.ACTIVE,
+      subscriptionPlanId: 'plan_1',
+      subscriptionPlanName: 'Monthly Standard',
+      subscriptionStartAt: '2025-05-13',
+      subscriptionEndAt: '2025-06-13',
+      gracePeriodDays: 7,
+      renewalPolicy: RenewalPolicy.EXTEND_FROM_EXPIRY,
+      createdAt: null,
+      updatedAt: null,
+    };
+
+    const candidates = evaluateDueReminders(
+      members,
+      {
+        ...settings,
+        paymentRemindersEnabled: true,
+        upcomingPaymentReminderDays: 3,
+        overduePaymentReminderDays: [1, 3, 7],
+        ownerSubReminderDays: [7, 3, 1, 0],
+      },
+      [],
+      '2025-06-10',
+      { memberships, gym }
+    );
+
+    expect(
+      candidates.some(
+        (c) =>
+          c.memberId === 'm_due' &&
+          c.category === ReminderCategory.UPCOMING_PAYMENT &&
+          c.template === 'PAYMENT_DUE_IN_2_DAYS'
+      )
+    ).toBe(true);
+    expect(
+      candidates.some(
+        (c) =>
+          c.memberId === 'm_overdue' &&
+          c.category === ReminderCategory.OVERDUE_PAYMENT &&
+          c.template === 'PAYMENT_OVERDUE_3_DAYS'
+      )
+    ).toBe(true);
+    expect(
+      candidates.some(
+        (c) =>
+          c.memberId === 'owner_g1' &&
+          c.category === ReminderCategory.SUBSCRIPTION_EXPIRY &&
+          c.template === 'OWNER_SUB_EXPIRING_IN_3_DAYS'
+      )
+    ).toBe(true);
+  });
+
+  it('caps reminder retries at MAX_REMINDER_RETRIES and marks success/retry states accurately', () => {
+    const maxedLog: NotificationLog = {
       id: 'l1',
       gymId: 'g1',
       memberId: 'm1',
@@ -600,9 +970,20 @@ describe('GymOS Reminder Automation, Deduplication, Opt-Out & CSV', () => {
       createdAt: null,
       updatedAt: null,
     };
-    const next = computeNextRetryState(log);
-    expect(next.canRetry).toBe(false);
-    expect(next.nextStatus).toBe(DeliveryStatus.FAILED);
+    const nextMaxed = computeNextRetryState(maxedLog, false, 'SMTP timeout');
+    expect(nextMaxed.canRetry).toBe(false);
+    expect(nextMaxed.nextStatus).toBe(DeliveryStatus.FAILED);
+
+    const retryableLog: NotificationLog = { ...maxedLog, retryCount: 0 };
+    const nextRetry = computeNextRetryState(retryableLog, false, 'Temporary error');
+    expect(nextRetry.canRetry).toBe(true);
+    expect(nextRetry.nextRetryCount).toBe(1);
+    expect(nextRetry.nextStatus).toBe(DeliveryStatus.RETRY_SCHEDULED);
+
+    const succeeded = computeNextRetryState(retryableLog, true);
+    expect(succeeded.canRetry).toBe(false);
+    expect(succeeded.nextRetryCount).toBe(1);
+    expect(succeeded.nextStatus).toBe(DeliveryStatus.SENT);
   });
 
   it('validates CSV rows, detects duplicate phones, and exports sanitized CSV', () => {

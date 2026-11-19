@@ -1,60 +1,77 @@
 # GymOS Deployment Guide
 
-GymOS is designed to run on free-tier cloud services or migrate seamlessly to a self-hosted VPS via Docker and PostgreSQL.
+GymOS uses a unified production architecture: **Firebase Authentication + Cloud Firestore** (enforced by `firestore.rules`), served alongside an **Express Node.js server (`server.ts`)** for static SPA delivery, SMTP email dispatch, Meta WhatsApp Cloud API integration, Super Admin bootstrap, and scheduled reminder sweeps.
 
-## 1. Local & Docker Deployment
+## 1. Environment Configuration
 
-1. Copy `.env.example` to `.env` and set strong credentials for `POSTGRES_PASSWORD`:
-   ```bash
-   cp .env.example .env
-   ```
-2. Start the frontend container and PostgreSQL 16 database:
-   ```bash
-   docker compose up --build -d
-   ```
-3. Verify `database/migrations/001_initial_schema.sql`, `002_rls_policies.sql`, and `003_indexes_and_constraints.sql` applied cleanly in `gymos-postgres`.
-4. Access GymOS at `http://localhost:3000`.
+Copy `.env.example` to `.env` and configure variables as needed:
 
-> **Staging/Dev Seed Only**: To populate sample SaaS plans on a non-production database, run `psql "$DATABASE_URL" -f database/seed.dev.sql`. Never run dev seeds in production.
+```bash
+cp .env.example .env
+```
 
-## 2. Node.js / VPS / PaaS Server Deployment
+- `PORT` (default `3000`) and `APP_URL`
+- `FIREBASE_SERVICE_ACCOUNT_JSON` (single-line JSON string) or `GOOGLE_APPLICATION_CREDENTIALS`: Required outside Google Cloud ADC environments for `POST /api/admin/bootstrap`, `scripts/init-super-admin.mjs`, and `POST /api/cron/reminders` / background retry sweeps.
+- `SUPER_ADMIN_BOOTSTRAP_TOKEN`: One-time secret used to initialize the first Super Admin via `/admin` (`POST /api/admin/bootstrap`). Clear after initial setup.
+- `SMTP_HOST`, `SMTP_PORT`, `SMTP_SECURE`, `SMTP_USER`, `SMTP_PASS`, `SMTP_FROM`: Free-first SMTP email configuration for member & owner reminders.
+- `WHATSAPP_CLOUD_ACCESS_TOKEN`, `WHATSAPP_API_VERSION`: Optional official Meta WhatsApp Business Cloud API token. Each gym still requires its own Phone Number ID and approved template in **Reminders**.
+- `CRON_SECRET`: Shared bearer token protecting `POST /api/cron/reminders`.
+- `REMINDER_WORKER_INTERVAL_MINUTES` (default `30`, set `0` to disable): Interval for automatic in-process `RETRY_SCHEDULED` reminder sweeps when Admin Firestore credentials are present.
 
-1. Build both the client bundle and production server:
-   ```bash
-   npm ci
-   npm run lint
-   npm test
-   npm run build
-   ```
-2. Start the production server (`PORT` defaults to `3000`):
-   ```bash
-   npm start
-   ```
-   - Health check endpoint: `GET /healthz`
-   - Gym Owner & Staff login portal: `/`
-   - Platform Admin login portal: `/admin`
+> **Security Note**: Never place private credentials (`SMTP_PASS`, `CRON_SECRET`, `SUPER_ADMIN_BOOTSTRAP_TOKEN`, `WHATSAPP_CLOUD_ACCESS_TOKEN`, `FIREBASE_SERVICE_ACCOUNT_JSON`) in `VITE_*` variables. Server secrets stay exclusively on the Node.js backend.
 
-## 3. Firebase Hosting / Cloudflare Pages / Vercel Deployment (Frontend + Firestore)
+## 2. Docker Compose Deployment (Reproducible Bun Build)
 
-1. Build the production bundle (`npm run build`).
-2. Validate and deploy Firestore rules before releasing client bundles:
-   ```bash
-   npx eslint firestore.rules
-   firebase deploy --only firestore:rules
-   ```
-3. Deploy `dist/` to Cloudflare Pages (`public/_redirects` included), Vercel (`vercel.json` included), Firebase Hosting, or Nginx on a VPS with SPA fallback (`try_files $uri /index.html;`).
+The multi-stage `Dockerfile` installs dependencies with `bun install --frozen-lockfile` using `bun.lock`, builds `dist/` and `dist-server/server.mjs`, and runs on `node:22-alpine` with a built-in `/healthz` healthcheck:
 
-## 3. Supabase + PostgreSQL Migration Path
+```bash
+docker compose up --build -d
+```
 
-1. Create a new Supabase project and open the SQL Editor (or connect via `psql "$DATABASE_URL"`).
-2. Execute migrations in strict numerical order:
-   - `database/migrations/001_initial_schema.sql`
-   - `database/migrations/002_rls_policies.sql`
-   - `database/migrations/003_indexes_and_constraints.sql`
-3. Configure Supabase Auth (Email/Google) so `request.jwt.claim.sub` and `request.jwt.claim.email` resolve automatically inside RLS policies.
-4. Set `VITE_SUPABASE_URL` and `VITE_SUPABASE_ANON_KEY` in your hosting environment.
+Verify container health:
+```bash
+curl -s http://localhost:3000/healthz
+```
 
-## 4. Scheduled Automation & Optional n8n
+## 3. Direct VPS / PaaS Deployment (Bun or Node 22+)
 
-- GymOS includes an in-app batch reminder evaluator (`runReminderBatchForGym`) backed by deduplication keys (`memberId__template__date__channel`).
-- For headless cron execution on a VPS or Supabase Edge Function, invoke the reminder job daily at `08:00` local gym time, or point an optional self-hosted n8n workflow to your webhook/Edge Function endpoint.
+```bash
+bun install --frozen-lockfile
+bun run lint
+bun run lint:rules
+bun run test
+bun run build
+NODE_ENV=production bun run start
+```
+
+Endpoints exposed by `dist-server/server.mjs`:
+- `GET /` — Gym Owner & Staff portal
+- `GET /admin` — Platform Super Admin portal
+- `GET /healthz` — Liveness & server capability check (booleans only, no secret values)
+- `GET /api/notifications/capabilities` — Email/WhatsApp/Admin SDK readiness flags
+- `POST /api/notifications/send` — Authenticated (`Authorization: Bearer <Firebase ID Token>`) SMTP/WhatsApp dispatch
+- `POST /api/admin/bootstrap` — Controlled first Super Admin initialization
+- `POST /api/cron/reminders` — Headless retry sweep (`Authorization: Bearer <CRON_SECRET>`)
+
+## 4. Deploying Firestore Security Rules
+
+Always lint and deploy `firestore.rules` before releasing frontend changes:
+
+```bash
+bun run lint:rules
+firebase deploy --only firestore:rules
+```
+
+To run the full Firebase Emulator integration suite in CI or on a workstation with Java installed:
+```bash
+bun run test:emulator
+```
+
+## 5. External Cron Setup (Optional)
+
+If running on serverless containers or disabling the in-process interval (`REMINDER_WORKER_INTERVAL_MINUTES=0`), schedule an external cron job daily or hourly:
+
+```bash
+curl -X POST https://your-domain.com/api/cron/reminders \
+  -H "Authorization: Bearer $CRON_SECRET"
+```

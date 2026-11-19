@@ -14,6 +14,7 @@ import { formatCurrency, formatDisplayDate, toIsoDate } from '../../lib/utils';
 import { addMonthsSafe } from '../../lib/domain/dates';
 import { StatusLabel } from '../common/StatusBadge';
 import { Modal } from '../common/Modal';
+import { Pagination } from '../common/Pagination';
 
 interface GymsManagementProps {
   actor: ActorContext;
@@ -35,6 +36,8 @@ export const GymsManagement: React.FC<GymsManagementProps> = ({
   const [search, setSearch] = useState('');
   const [accountFilter, setAccountFilter] = useState<string>('ALL');
   const [subFilter, setSubFilter] = useState<string>('ALL');
+  const [page, setPage] = useState(1);
+  const PAGE_SIZE = 20;
 
   const [showCreateModal, setShowCreateModal] = useState(false);
   const [detailGym, setDetailGym] = useState<Gym | null>(null);
@@ -44,6 +47,7 @@ export const GymsManagement: React.FC<GymsManagementProps> = ({
   const [newEndDate, setNewEndDate] = useState('');
   const [newPlanId, setNewPlanId] = useState('');
   const [newSubStatus, setNewSubStatus] = useState<SubscriptionStatus>(SubscriptionStatus.ACTIVE);
+  const [newGraceDays, setNewGraceDays] = useState('7');
 
   const [paymentGym, setPaymentGym] = useState<Gym | null>(null);
   const [payAmount, setPayAmount] = useState('0');
@@ -63,6 +67,7 @@ export const GymsManagement: React.FC<GymsManagementProps> = ({
     planId: plans[0]?.id || '',
     subscriptionStatus: SubscriptionStatus.TRIAL,
     accountStatus: AccountStatus.ACTIVE,
+    gracePeriodDays: '7',
   });
 
   const [busy, setBusy] = useState(false);
@@ -84,6 +89,13 @@ export const GymsManagement: React.FC<GymsManagementProps> = ({
     });
   }, [gyms, search, accountFilter, subFilter]);
 
+  const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
+  const currentPage = Math.min(page, totalPages);
+  const paginated = useMemo(
+    () => filtered.slice((currentPage - 1) * PAGE_SIZE, currentPage * PAGE_SIZE),
+    [filtered, currentPage]
+  );
+
   const handleCreateGym = async (e: React.FormEvent) => {
     e.preventDefault();
     const plan = plans.find((p) => p.id === (createForm.planId || plans[0]?.id));
@@ -103,6 +115,7 @@ export const GymsManagement: React.FC<GymsManagementProps> = ({
         plan,
         subscriptionStatus: createForm.subscriptionStatus,
         accountStatus: createForm.accountStatus,
+        gracePeriodDays: Math.max(0, Number(createForm.gracePeriodDays) || 0),
       });
       setShowCreateModal(false);
       setCreateForm({
@@ -114,8 +127,9 @@ export const GymsManagement: React.FC<GymsManagementProps> = ({
         planId: plans[0]?.id || '',
         subscriptionStatus: SubscriptionStatus.TRIAL,
         accountStatus: AccountStatus.ACTIVE,
+        gracePeriodDays: '7',
       });
-      setFeedback('Gym created successfully.');
+      setFeedback('Gym created and owner invitation issued.');
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : 'Failed to create gym.');
     } finally {
@@ -176,6 +190,7 @@ export const GymsManagement: React.FC<GymsManagementProps> = ({
     setBusy(true);
     setErrorMsg(null);
     try {
+      const graceDays = Math.max(0, Math.min(90, Number(newGraceDays) || 0));
       await updateGymAccountState(
         actor,
         extendGym,
@@ -184,9 +199,10 @@ export const GymsManagement: React.FC<GymsManagementProps> = ({
           subscriptionPlanName: plan ? plan.name : extendGym.subscriptionPlanName,
           subscriptionEndAt: newEndDate,
           subscriptionStatus: newSubStatus,
+          gracePeriodDays: graceDays,
           accountStatus: AccountStatus.ACTIVE,
         },
-        `Updated subscription for ${extendGym.name} (${plan?.name ?? extendGym.subscriptionPlanName}, expires ${newEndDate}, status ${newSubStatus})`
+        `Updated subscription for ${extendGym.name} (${plan?.name ?? extendGym.subscriptionPlanName}, expires ${newEndDate}, grace ${graceDays}d, status ${newSubStatus})`
       );
       setExtendGym(null);
       setFeedback(`Updated subscription for ${extendGym.name}.`);
@@ -242,14 +258,20 @@ export const GymsManagement: React.FC<GymsManagementProps> = ({
             <input
               type="text"
               value={search}
-              onChange={(e) => setSearch(e.target.value)}
+              onChange={(e) => {
+                setSearch(e.target.value);
+                setPage(1);
+              }}
               placeholder="Search gym, owner, email, phone..."
               className="w-full pl-9 pr-3 py-2 text-xs bg-white border border-slate-200 rounded-md focus:outline-none focus:ring-2 focus:ring-teal-700"
             />
           </div>
           <select
             value={accountFilter}
-            onChange={(e) => setAccountFilter(e.target.value)}
+            onChange={(e) => {
+              setAccountFilter(e.target.value);
+              setPage(1);
+            }}
             className="px-3 py-2 text-xs bg-white border border-slate-200 rounded-md"
           >
             <option value="ALL">All Account Statuses</option>
@@ -258,7 +280,10 @@ export const GymsManagement: React.FC<GymsManagementProps> = ({
           </select>
           <select
             value={subFilter}
-            onChange={(e) => setSubFilter(e.target.value)}
+            onChange={(e) => {
+              setSubFilter(e.target.value);
+              setPage(1);
+            }}
             className="px-3 py-2 text-xs bg-white border border-slate-200 rounded-md"
           >
             <option value="ALL">All Subscription Statuses</option>
@@ -322,10 +347,17 @@ export const GymsManagement: React.FC<GymsManagementProps> = ({
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-200">
-                {filtered.map((g) => (
+                {paginated.map((g) => (
                   <tr key={g.id} className="hover:bg-slate-50">
                     <td className="px-4 py-3 font-medium text-slate-900">{g.name}</td>
-                    <td className="px-4 py-3 text-slate-700">{g.ownerName}</td>
+                    <td className="px-4 py-3 text-slate-700">
+                      <div>{g.ownerName}</div>
+                      {g.ownerUid.startsWith('owner_pending') && (
+                        <span className="inline-block text-[10px] font-medium text-amber-700">
+                          Awaiting owner sign-in claim
+                        </span>
+                      )}
+                    </td>
                     <td className="px-4 py-3 text-slate-600">
                       <div>{g.email}</div>
                       <div className="font-mono text-[11px] text-slate-500 tabular-nums">
@@ -340,7 +372,10 @@ export const GymsManagement: React.FC<GymsManagementProps> = ({
                       <StatusLabel status={g.subscriptionStatus} />
                     </td>
                     <td className="px-4 py-3 font-mono text-slate-700 tabular-nums whitespace-nowrap">
-                      {formatDisplayDate(g.subscriptionEndAt)}
+                      <div>{formatDisplayDate(g.subscriptionEndAt)}</div>
+                      <span className="text-[10px] text-slate-400">
+                        +{g.gracePeriodDays ?? 0}d grace
+                      </span>
                     </td>
                     <td className="px-4 py-3">
                       <StatusLabel status={g.accountStatus} />
@@ -390,6 +425,7 @@ export const GymsManagement: React.FC<GymsManagementProps> = ({
                             setNewEndDate(g.subscriptionEndAt);
                             setNewPlanId(g.subscriptionPlanId);
                             setNewSubStatus(g.subscriptionStatus);
+                            setNewGraceDays(String(g.gracePeriodDays ?? 7));
                           }}
                           className="p-1.5 text-slate-500 hover:text-slate-900 hover:bg-slate-100 rounded cursor-pointer"
                           title="Extend or change plan"
@@ -425,6 +461,12 @@ export const GymsManagement: React.FC<GymsManagementProps> = ({
             </table>
           </div>
         )}
+        <Pagination
+          page={currentPage}
+          pageSize={PAGE_SIZE}
+          totalItems={filtered.length}
+          onPageChange={setPage}
+        />
       </div>
 
       {/* Create Gym Modal */}
@@ -515,6 +557,21 @@ export const GymsManagement: React.FC<GymsManagementProps> = ({
                 <option value={SubscriptionStatus.ACTIVE}>Active</option>
                 <option value={SubscriptionStatus.PENDING}>Pending</option>
               </select>
+            </div>
+            <div>
+              <label className="block text-xs font-medium text-slate-700 mb-1">
+                Billing Grace Period (Days)
+              </label>
+              <input
+                type="number"
+                min="0"
+                max="90"
+                value={createForm.gracePeriodDays}
+                onChange={(e) =>
+                  setCreateForm({ ...createForm, gracePeriodDays: e.target.value })
+                }
+                className="w-full px-3 py-2 text-xs border border-slate-200 rounded-md font-mono"
+              />
             </div>
           </div>
           <div className="flex justify-end gap-3 pt-2">
@@ -611,15 +668,30 @@ export const GymsManagement: React.FC<GymsManagementProps> = ({
               <option value={SubscriptionStatus.CANCELLED}>Cancelled</option>
             </select>
           </div>
-          <div>
-            <label className="block text-xs font-medium text-slate-700 mb-1">Expiry Date *</label>
-            <input
-              type="date"
-              required
-              value={newEndDate}
-              onChange={(e) => setNewEndDate(e.target.value)}
-              className="w-full px-3 py-2 text-xs border border-slate-200 rounded-md font-mono"
-            />
+          <div className="grid grid-cols-2 gap-4">
+            <div>
+              <label className="block text-xs font-medium text-slate-700 mb-1">Expiry Date *</label>
+              <input
+                type="date"
+                required
+                value={newEndDate}
+                onChange={(e) => setNewEndDate(e.target.value)}
+                className="w-full px-3 py-2 text-xs border border-slate-200 rounded-md font-mono"
+              />
+            </div>
+            <div>
+              <label className="block text-xs font-medium text-slate-700 mb-1">
+                Grace Period (Days)
+              </label>
+              <input
+                type="number"
+                min="0"
+                max="90"
+                value={newGraceDays}
+                onChange={(e) => setNewGraceDays(e.target.value)}
+                className="w-full px-3 py-2 text-xs border border-slate-200 rounded-md font-mono"
+              />
+            </div>
           </div>
           <div className="flex justify-end gap-3">
             <button
@@ -779,6 +851,20 @@ export const GymsManagement: React.FC<GymsManagementProps> = ({
                 <div className="mt-1">
                   <StatusLabel status={detailGym.accountStatus} />
                 </div>
+              </div>
+              <div>
+                <p className="text-slate-500">Owner Claim Status</p>
+                <p className="text-slate-900 mt-0.5">
+                  {detailGym.ownerUid.startsWith('owner_pending')
+                    ? `Pending claim (Invite ${detailGym.ownerInvitationId || 'issued'})`
+                    : 'Claimed & active'}
+                </p>
+              </div>
+              <div>
+                <p className="text-slate-500">Billing Grace Period</p>
+                <p className="font-mono text-slate-900 mt-0.5">
+                  {detailGym.gracePeriodDays ?? 0} days
+                </p>
               </div>
             </div>
 

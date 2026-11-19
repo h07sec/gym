@@ -8,7 +8,7 @@ import { formatCurrency, formatDisplayDate } from '../../lib/utils';
 import { StatusLabel } from '../common/StatusBadge';
 
 export const SuspendedScreen: React.FC = () => {
-  const { gym, profile, platformSettings, signOut } = useAuth();
+  const { gym, profile, subscriptionAccess, platformSettings, signOut } = useAuth();
   const [payments, setPayments] = useState<SubscriptionPayment[]>([]);
   const [showBilling, setShowBilling] = useState(false);
 
@@ -32,6 +32,25 @@ export const SuspendedScreen: React.FC = () => {
     loadPayments();
   }, [isOwner, gym]);
 
+  const reason = subscriptionAccess?.reason || 'SUSPENDED';
+  const heading =
+    reason === 'PENDING_VERIFICATION'
+      ? 'Your GymOS subscription is awaiting activation.'
+      : reason === 'EXPIRED'
+        ? 'Your GymOS subscription has expired.'
+        : reason === 'CANCELLED'
+          ? 'Your GymOS subscription has been cancelled.'
+          : 'Your GymOS account has been paused.';
+
+  const description =
+    reason === 'PENDING_VERIFICATION'
+      ? 'Complete your manual UPI or Cash subscription payment using the instructions below. Your workspace unlocks immediately after payment verification.'
+      : reason === 'EXPIRED'
+        ? `Your subscription period ended on ${formatDisplayDate(gym?.subscriptionEndAt)} (including grace period through ${formatDisplayDate(subscriptionAccess?.effectiveAccessUntil)}). Renew your plan to restore full workspace access.`
+        : reason === 'CANCELLED'
+          ? 'Your gym subscription is currently cancelled. All your member and payment data remains preserved—contact support to reactivate.'
+          : 'Your gym account has been temporarily suspended. Please contact GymOS support to restore access.';
+
   return (
     <div className="min-h-screen bg-[#F8FAFC] flex flex-col">
       <header className="bg-white border-b border-slate-200 px-6 h-16 flex items-center justify-between">
@@ -54,15 +73,11 @@ export const SuspendedScreen: React.FC = () => {
                 <Lock className="w-5 h-5" />
               </div>
               <div className="space-y-2">
-                <h1 className="text-xl font-semibold text-slate-900">
-                  Your GymOS subscription is inactive.
-                </h1>
-                <p className="text-sm text-slate-600 leading-relaxed">
-                  Your gym account has been temporarily paused. Please contact GymOS support to restore access.
-                </p>
+                <h1 className="text-xl font-semibold text-slate-900">{heading}</h1>
+                <p className="text-sm text-slate-600 leading-relaxed">{description}</p>
                 {gym?.suspensionReason && (
                   <p className="text-xs text-red-700 bg-red-50 border border-red-200 rounded-md px-3 py-2">
-                    Reason: {gym.suspensionReason}
+                    Note: {gym.suspensionReason}
                   </p>
                 )}
               </div>
@@ -74,8 +89,9 @@ export const SuspendedScreen: React.FC = () => {
                 <p className="font-medium text-slate-900 mt-0.5">{gym?.name}</p>
               </div>
               <div>
-                <p className="text-xs text-slate-500">Subscription Status</p>
-                <div className="mt-1">
+                <p className="text-xs text-slate-500">Account &amp; Subscription</p>
+                <div className="mt-1 flex flex-wrap gap-1.5">
+                  <StatusLabel status={gym?.accountStatus || 'SUSPENDED'} />
                   <StatusLabel status={gym?.subscriptionStatus || 'EXPIRED'} />
                 </div>
               </div>
@@ -105,21 +121,19 @@ export const SuspendedScreen: React.FC = () => {
                       {platformSettings.supportEmail}
                     </span>
                   )}
-                  {platformSettings.supportPhone &&
-                    platformSettings.supportPhone !== '+91-98000-00000' && (
-                      <span className="inline-flex items-center gap-1.5 font-mono tabular-nums">
-                        <Phone className="w-3.5 h-3.5 text-slate-500" />
-                        {platformSettings.supportPhone}
-                      </span>
-                    )}
-                  {platformSettings.upiId &&
-                    platformSettings.upiId !== 'gymos.platform@upi' && (
-                      <span className="inline-flex items-center gap-1.5 font-mono">
-                        <CreditCard className="w-3.5 h-3.5 text-slate-500" />
-                        UPI: {platformSettings.upiId}
-                        {platformSettings.upiPayeeName ? ` (${platformSettings.upiPayeeName})` : ''}
-                      </span>
-                    )}
+                  {platformSettings.supportPhone && (
+                    <span className="inline-flex items-center gap-1.5 font-mono tabular-nums">
+                      <Phone className="w-3.5 h-3.5 text-slate-500" />
+                      {platformSettings.supportPhone}
+                    </span>
+                  )}
+                  {platformSettings.upiId && (
+                    <span className="inline-flex items-center gap-1.5 font-mono">
+                      <CreditCard className="w-3.5 h-3.5 text-slate-500" />
+                      UPI: {platformSettings.upiId}
+                      {platformSettings.upiPayeeName ? ` (${platformSettings.upiPayeeName})` : ''}
+                    </span>
+                  )}
                 </div>
                 {platformSettings.paymentInstructions && (
                   <p className="text-xs text-slate-600 leading-relaxed bg-slate-50 border border-slate-200 rounded-md p-3">
@@ -132,7 +146,7 @@ export const SuspendedScreen: React.FC = () => {
             {isOwner && (
               <div className="border-t border-slate-200 pt-4 flex items-center justify-between">
                 <span className="text-xs text-slate-500">
-                  Account access is paused until your subscription is renewed.
+                  Operational modules remain paused while subscription access is inactive.
                 </span>
                 <button
                   type="button"

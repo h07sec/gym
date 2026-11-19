@@ -56,7 +56,7 @@
         "uid": { "type": "string", "maxLength": 128 },
         "email": { "type": "string", "format": "email", "maxLength": 200 },
         "displayName": { "type": "string", "maxLength": 120 },
-        "role": { "type": "string", "enum": ["SUPER_ADMIN", "GYM_OWNER", "GYM_MANAGER", "GYM_RECEPTIONIST"] },
+        "role": { "type": "string", "enum": ["SUPER_ADMIN", "GYM_OWNER", "GYM_MANAGER", "GYM_RECEPTIONIST", "GYM_TRAINER"] },
         "gymId": { "type": "string", "maxLength": 128 },
         "invitationId": { "type": "string", "maxLength": 128 },
         "status": { "type": "string", "enum": ["ACTIVE", "DEACTIVATED"] },
@@ -83,6 +83,8 @@
         "subscriptionPlanName": { "type": "string", "maxLength": 80 },
         "subscriptionStartAt": { "type": "string", "format": "date-time" },
         "subscriptionEndAt": { "type": "string", "format": "date-time" },
+        "subscriptionAccessUntil": { "type": "string", "format": "date-time" },
+        "ownerInvitationId": { "type": "string", "maxLength": 128 },
         "gracePeriodDays": { "type": "integer" },
         "renewalPolicy": { "type": "string", "enum": ["EXTEND_FROM_EXPIRY", "START_TODAY_IF_EXPIRED"] },
         "suspensionReason": { "type": "string", "maxLength": 400 },
@@ -109,7 +111,7 @@
         "paymentDate": { "type": "string", "maxLength": 32 },
         "periodStart": { "type": "string", "maxLength": 32 },
         "periodEnd": { "type": "string", "maxLength": 32 },
-        "status": { "type": "string", "enum": ["RECORDED", "VERIFIED", "REJECTED"] },
+        "status": { "type": "string", "enum": ["PENDING", "RECORDED", "VERIFIED", "REJECTED"] },
         "notes": { "type": "string", "maxLength": 500 },
         "recordedByUid": { "type": "string", "maxLength": 128 },
         "verifiedByUid": { "type": "string", "maxLength": 128 },
@@ -130,6 +132,11 @@
         "reminderDaysBefore": { "type": "array" },
         "sendOnExpiryDay": { "type": "boolean" },
         "sendAfterExpiryDays": { "type": "array" },
+        "paymentRemindersEnabled": { "type": "boolean" },
+        "upcomingPaymentReminderDays": { "type": "integer" },
+        "overduePaymentReminderDays": { "type": "array" },
+        "ownerSubReminderDays": { "type": "array" },
+        "lastReminderRunDate": { "type": "string", "maxLength": 20 },
         "emailEnabled": { "type": "boolean" },
         "emailFromName": { "type": "string", "maxLength": 120 },
         "inAppEnabled": { "type": "boolean" },
@@ -153,7 +160,8 @@
         "email": { "type": "string", "maxLength": 200 },
         "fullName": { "type": "string", "maxLength": 120 },
         "phone": { "type": "string", "maxLength": 40 },
-        "role": { "type": "string", "enum": ["GYM_OWNER", "GYM_MANAGER", "GYM_RECEPTIONIST"] },
+        "role": { "type": "string", "enum": ["GYM_OWNER", "GYM_MANAGER", "GYM_RECEPTIONIST", "GYM_TRAINER"] },
+        "roleTitle": { "type": "string", "maxLength": 64 },
         "status": { "type": "string", "enum": ["ACTIVE", "DEACTIVATED"] },
         "permissions": { "type": "object" },
         "createdAt": { "type": "string", "format": "date-time" },
@@ -163,7 +171,7 @@
     },
     "StaffInvitation": {
       "title": "StaffInvitation",
-      "description": "Secure staff invitation tied to a gym and email.",
+      "description": "Secure staff or gym owner invitation tied to a gym and email.",
       "type": "object",
       "properties": {
         "id": { "type": "string", "maxLength": 128 },
@@ -171,7 +179,8 @@
         "gymName": { "type": "string", "maxLength": 120 },
         "email": { "type": "string", "maxLength": 200 },
         "fullName": { "type": "string", "maxLength": 120 },
-        "role": { "type": "string", "enum": ["GYM_MANAGER", "GYM_RECEPTIONIST"] },
+        "role": { "type": "string", "enum": ["GYM_OWNER", "GYM_MANAGER", "GYM_RECEPTIONIST", "GYM_TRAINER"] },
+        "roleTitle": { "type": "string", "maxLength": 64 },
         "permissions": { "type": "object" },
         "status": { "type": "string", "enum": ["PENDING", "ACCEPTED", "REVOKED"] },
         "invitedByUid": { "type": "string", "maxLength": 128 },
@@ -201,7 +210,7 @@
         "currentPlanName": { "type": "string", "maxLength": 100 },
         "membershipStartDate": { "type": "string", "maxLength": 20 },
         "membershipExpiryDate": { "type": "string", "maxLength": 20 },
-        "membershipStatus": { "type": "string", "enum": ["ACTIVE", "EXPIRING_SOON", "EXPIRED", "NONE"] },
+        "membershipStatus": { "type": "string", "enum": ["ACTIVE", "EXPIRING_SOON", "EXPIRED", "CANCELLED", "NONE"] },
         "outstandingBalance": { "type": "number" },
         "reminderOptOut": { "type": "boolean" },
         "notes": { "type": "string", "maxLength": 1000 },
@@ -232,7 +241,7 @@
     },
     "Membership": {
       "title": "Membership",
-      "description": "Individual membership assignment or renewal history entry.",
+      "description": "Individual membership assignment, renewal, or cancellation history entry.",
       "type": "object",
       "properties": {
         "id": { "type": "string", "maxLength": 128 },
@@ -245,10 +254,15 @@
         "startDate": { "type": "string", "maxLength": 20 },
         "expiryDate": { "type": "string", "maxLength": 20 },
         "planPrice": { "type": "number" },
+        "discountAmount": { "type": "number" },
+        "discountReason": { "type": "string", "maxLength": 200 },
         "amountPaid": { "type": "number" },
         "balanceDue": { "type": "number" },
+        "dueDate": { "type": "string", "maxLength": 20 },
         "status": { "type": "string", "enum": ["ACTIVE", "EXPIRED", "SUPERSEDED", "CANCELLED"] },
         "recordedByUid": { "type": "string", "maxLength": 128 },
+        "cancelledAt": { "type": "string", "maxLength": 32 },
+        "cancellationReason": { "type": "string", "maxLength": 300 },
         "notes": { "type": "string", "maxLength": 500 },
         "createdAt": { "type": "string", "format": "date-time" },
         "updatedAt": { "type": "string", "format": "date-time" }
@@ -267,11 +281,14 @@
         "memberName": { "type": "string", "maxLength": 120 },
         "membershipId": { "type": "string", "maxLength": 128 },
         "amount": { "type": "number" },
+        "discountAmount": { "type": "number" },
+        "discountReason": { "type": "string", "maxLength": 200 },
         "paymentMode": { "type": "string", "enum": ["CASH", "UPI"] },
         "paymentPurpose": { "type": "string", "enum": ["MEMBERSHIP", "RENEWAL", "BALANCE_SETTLEMENT", "ADVANCE"] },
         "transactionReference": { "type": "string", "maxLength": 120 },
         "attachmentName": { "type": "string", "maxLength": 160 },
         "paymentDate": { "type": "string", "maxLength": 20 },
+        "dueDate": { "type": "string", "maxLength": 20 },
         "status": { "type": "string", "enum": ["PENDING", "CONFIRMED", "REJECTED", "REFUNDED"] },
         "recordedByUid": { "type": "string", "maxLength": 128 },
         "recordedByName": { "type": "string", "maxLength": 120 },
@@ -303,6 +320,26 @@
         "issuedByUid": { "type": "string", "maxLength": 128 }
       },
       "required": ["id", "receiptNumber", "gymId", "gymName", "paymentId", "memberId", "memberName", "memberCode", "amount", "paymentMode", "issuedAt", "issuedByUid"]
+    },
+    "AttendanceRecord": {
+      "title": "AttendanceRecord",
+      "description": "Gym member check-in and check-out attendance entry.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "gymId": { "type": "string", "maxLength": 128 },
+        "memberId": { "type": "string", "maxLength": 128 },
+        "memberCode": { "type": "string", "maxLength": 32 },
+        "memberName": { "type": "string", "maxLength": 120 },
+        "checkInDate": { "type": "string", "maxLength": 20 },
+        "checkInTime": { "type": "string", "maxLength": 40 },
+        "checkOutTime": { "type": "string", "maxLength": 40 },
+        "recordedByUid": { "type": "string", "maxLength": 128 },
+        "recordedByName": { "type": "string", "maxLength": 120 },
+        "notes": { "type": "string", "maxLength": 300 },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "gymId", "memberId", "memberCode", "memberName", "checkInDate", "checkInTime", "recordedByUid", "recordedByName", "createdAt"]
     },
     "GymNotification": {
       "title": "GymNotification",
@@ -336,7 +373,7 @@
     },
     "NotificationLog": {
       "title": "NotificationLog",
-      "description": "Reminder delivery log with deduplication key, retries, and error tracking.",
+      "description": "Reminder delivery log with deduplication key, retries, provider message ID, and error tracking.",
       "type": "object",
       "properties": {
         "id": { "type": "string", "maxLength": 128 },
@@ -345,12 +382,17 @@
         "memberName": { "type": "string", "maxLength": 120 },
         "recipient": { "type": "string", "maxLength": 200 },
         "channel": { "type": "string", "enum": ["EMAIL", "IN_APP", "WHATSAPP_CLOUD"] },
+        "category": { "type": "string", "enum": ["MEMBERSHIP_EXPIRY", "UPCOMING_PAYMENT", "OVERDUE_PAYMENT", "SUBSCRIPTION_EXPIRY"] },
         "template": { "type": "string", "maxLength": 80 },
         "dedupKey": { "type": "string", "maxLength": 160 },
         "scheduledDate": { "type": "string", "maxLength": 20 },
         "deliveryStatus": { "type": "string", "enum": ["SENT", "FAILED", "RETRY_SCHEDULED", "SKIPPED_OPT_OUT"] },
         "retryCount": { "type": "integer" },
         "errorDetails": { "type": "string", "maxLength": 400 },
+        "providerMessageId": { "type": "string", "maxLength": 200 },
+        "sentAt": { "type": "string", "maxLength": 40 },
+        "lastAttemptAt": { "type": "string", "maxLength": 40 },
+        "nextRetryAt": { "type": "string", "maxLength": 40 },
         "createdAt": { "type": "string", "format": "date-time" },
         "updatedAt": { "type": "string", "format": "date-time" }
       },
@@ -398,7 +440,7 @@
     },
     "/invitations/{invitationId}": {
       "schema": { "$ref": "#/entities/StaffInvitation" },
-      "description": "Gym staff invitations"
+      "description": "Gym staff and owner invitations"
     },
     "/gyms/{gymId}": {
       "schema": { "$ref": "#/entities/Gym" },
@@ -431,6 +473,10 @@
     "/gyms/{gymId}/payment_receipts/{receiptId}": {
       "schema": { "$ref": "#/entities/PaymentReceipt" },
       "description": "Tenant immutable payment receipts"
+    },
+    "/gyms/{gymId}/attendance/{attendanceId}": {
+      "schema": { "$ref": "#/entities/AttendanceRecord" },
+      "description": "Tenant member attendance check-in records"
     },
     "/gyms/{gymId}/notifications/{notificationId}": {
       "schema": { "$ref": "#/entities/GymNotification" },

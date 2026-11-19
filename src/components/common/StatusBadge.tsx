@@ -30,13 +30,35 @@ const TONE_MAP: Record<Tone, { text: string; icon: React.ReactNode }> = {
 
 export function resolveStatusTone(status: string): Tone {
   const s = status.toUpperCase();
-  if (['ACTIVE', 'CONFIRMED', 'VERIFIED', 'SENT', 'ACCEPTED'].includes(s)) {
+  if (['ACTIVE', 'CONFIRMED', 'VERIFIED', 'SENT', 'ACCEPTED', 'PAID'].includes(s)) {
     return 'success';
   }
-  if (['TRIAL', 'PENDING', 'EXPIRING_SOON', 'RECORDED', 'RETRY_SCHEDULED'].includes(s)) {
+  if (
+    [
+      'TRIAL',
+      'PENDING',
+      'EXPIRING_SOON',
+      'RECORDED',
+      'RETRY_SCHEDULED',
+      'PARTIALLY_PAID',
+      'PENDING_VERIFICATION',
+    ].includes(s)
+  ) {
     return 'warning';
   }
-  if (['SUSPENDED', 'EXPIRED', 'REJECTED', 'FAILED', 'CANCELLED', 'DEACTIVATED', 'REVOKED'].includes(s)) {
+  if (
+    [
+      'SUSPENDED',
+      'EXPIRED',
+      'REJECTED',
+      'FAILED',
+      'CANCELLED',
+      'DEACTIVATED',
+      'REVOKED',
+      'OVERDUE',
+      'UNPAID',
+    ].includes(s)
+  ) {
     return 'danger';
   }
   return 'neutral';

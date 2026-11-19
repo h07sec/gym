@@ -1,5 +1,5 @@
-import React, { useState } from 'react';
-import { CheckCircle2, Plus } from 'lucide-react';
+import React, { useMemo, useState } from 'react';
+import { CheckCircle2, Plus, XCircle } from 'lucide-react';
 import {
   Gym,
   PaymentMode,
@@ -10,12 +10,15 @@ import {
 import {
   ActorContext,
   recordManualSubscriptionPayment,
+  rejectSubscriptionPayment,
   verifyExistingSubscriptionPayment,
 } from '../../services/gymos-service';
 import { formatCurrency, formatDisplayDate, toIsoDate } from '../../lib/utils';
 import { addMonthsSafe } from '../../lib/domain/dates';
 import { StatusLabel } from '../common/StatusBadge';
 import { Modal } from '../common/Modal';
+import { ConfirmModal } from '../common/ConfirmModal';
+import { Pagination } from '../common/Pagination';
 
 interface SubscriptionPaymentsViewProps {
   actor: ActorContext;
@@ -31,7 +34,12 @@ export const SubscriptionPaymentsView: React.FC<SubscriptionPaymentsViewProps> =
   payments,
 }) => {
   const [statusFilter, setStatusFilter] = useState('ALL');
+  const [page, setPage] = useState(1);
+  const PAGE_SIZE = 20;
+
   const [showAddModal, setShowAddModal] = useState(false);
+  const [rejectingPayment, setRejectingPayment] = useState<SubscriptionPayment | null>(null);
+
   const [selectedGymId, setSelectedGymId] = useState(gyms[0]?.id || '');
   const [selectedPlanId, setSelectedPlanId] = useState(plans[0]?.id || '');
   const [amount, setAmount] = useState(String(plans[0]?.price || 1499));
@@ -44,9 +52,19 @@ export const SubscriptionPaymentsView: React.FC<SubscriptionPaymentsViewProps> =
   const [verifyImmediately, setVerifyImmediately] = useState(false);
   const [busy, setBusy] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [feedback, setFeedback] = useState<string | null>(null);
 
-  const filtered = payments.filter((p) =>
-    statusFilter === 'ALL' ? true : p.status === statusFilter
+  const filtered = useMemo(
+    () =>
+      payments.filter((p) => (statusFilter === 'ALL' ? true : p.status === statusFilter)),
+    [payments, statusFilter]
+  );
+
+  const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
+  const currentPage = Math.min(page, totalPages);
+  const paginated = useMemo(
+    () => filtered.slice((currentPage - 1) * PAGE_SIZE, currentPage * PAGE_SIZE),
+    [filtered, currentPage]
   );
 
   const handleCreate = async (e: React.FormEvent) => {
@@ -59,6 +77,7 @@ export const SubscriptionPaymentsView: React.FC<SubscriptionPaymentsViewProps> =
     }
     setBusy(true);
     setErrorMsg(null);
+    setFeedback(null);
     try {
       await recordManualSubscriptionPayment(actor, {
         gym,
@@ -75,6 +94,11 @@ export const SubscriptionPaymentsView: React.FC<SubscriptionPaymentsViewProps> =
       setShowAddModal(false);
       setTxRef('');
       setNotes('');
+      setFeedback(
+        verifyImmediately
+          ? `Verified payment and extended ${gym.name} through ${periodEnd}.`
+          : `Recorded subscription payment for ${gym.name}.`
+      );
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : 'Failed to record payment.');
     } finally {
@@ -85,12 +109,27 @@ export const SubscriptionPaymentsView: React.FC<SubscriptionPaymentsViewProps> =
   const handleVerify = async (paymentId: string) => {
     setBusy(true);
     setErrorMsg(null);
+    setFeedback(null);
     try {
       await verifyExistingSubscriptionPayment(actor, paymentId);
+      setFeedback('Subscription payment verified and gym subscription extended.');
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : 'Verification failed.');
     } finally {
       setBusy(false);
+    }
+  };
+
+  const handleRejectConfirm = async (reason?: string) => {
+    if (!rejectingPayment || !reason) return;
+    setErrorMsg(null);
+    setFeedback(null);
+    try {
+      await rejectSubscriptionPayment(actor, rejectingPayment, reason);
+      setFeedback(`Rejected subscription payment for ${rejectingPayment.gymName}.`);
+      setRejectingPayment(null);
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : 'Rejection failed.');
     }
   };
 
@@ -100,11 +139,19 @@ export const SubscriptionPaymentsView: React.FC<SubscriptionPaymentsViewProps> =
         <div className="flex items-center gap-3">
           <select
             value={statusFilter}
-            onChange={(e) => setStatusFilter(e.target.value)}
+            onChange={(e) => {
+              setStatusFilter(e.target.value);
+              setPage(1);
+            }}
             className="px-3 py-2 text-xs bg-white border border-slate-200 rounded-md"
           >
             <option value="ALL">All Payment Statuses</option>
-            <option value={SubscriptionPaymentStatus.RECORDED}>Recorded (Pending Verification)</option>
+            <option value={SubscriptionPaymentStatus.PENDING}>
+              Pending (Owner Submitted)
+            </option>
+            <option value={SubscriptionPaymentStatus.RECORDED}>
+              Recorded (Pending Verification)
+            </option>
             <option value={SubscriptionPaymentStatus.VERIFIED}>Verified</option>
             <option value={SubscriptionPaymentStatus.REJECTED}>Rejected</option>
           </select>
@@ -126,9 +173,20 @@ export const SubscriptionPaymentsView: React.FC<SubscriptionPaymentsViewProps> =
         </button>
       </div>
 
+      {feedback && (
+        <div className="px-4 py-2.5 bg-emerald-50 border border-emerald-200 rounded-md text-xs text-emerald-800 flex items-center justify-between">
+          <span>{feedback}</span>
+          <button type="button" onClick={() => setFeedback(null)} className="font-semibold cursor-pointer">
+            Dismiss
+          </button>
+        </div>
+      )}
       {errorMsg && (
-        <div className="px-4 py-2.5 bg-red-50 border border-red-200 rounded-md text-xs text-red-700">
-          {errorMsg}
+        <div className="px-4 py-2.5 bg-red-50 border border-red-200 rounded-md text-xs text-red-700 flex items-center justify-between">
+          <span>{errorMsg}</span>
+          <button type="button" onClick={() => setErrorMsg(null)} className="font-semibold cursor-pointer">
+            Dismiss
+          </button>
         </div>
       )}
 
@@ -145,7 +203,7 @@ export const SubscriptionPaymentsView: React.FC<SubscriptionPaymentsViewProps> =
                   <th className="px-4 py-3 font-medium">Payment Date</th>
                   <th className="px-4 py-3 font-medium">Gym</th>
                   <th className="px-4 py-3 font-medium">Plan</th>
-                  <th className="px-4 py-3 font-medium">Mode & Reference</th>
+                  <th className="px-4 py-3 font-medium">Mode &amp; Reference</th>
                   <th className="px-4 py-3 font-medium">Subscription Period</th>
                   <th className="px-4 py-3 font-medium text-right">Amount</th>
                   <th className="px-4 py-3 font-medium">Status</th>
@@ -153,60 +211,90 @@ export const SubscriptionPaymentsView: React.FC<SubscriptionPaymentsViewProps> =
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-200">
-                {filtered.map((p) => (
-                  <tr key={p.id} className="hover:bg-slate-50">
-                    <td className="px-4 py-3 font-mono tabular-nums text-slate-700">
-                      {formatDisplayDate(p.paymentDate)}
-                    </td>
-                    <td className="px-4 py-3 font-medium text-slate-900">{p.gymName}</td>
-                    <td className="px-4 py-3 text-slate-700">{p.planName}</td>
-                    <td className="px-4 py-3">
-                      <span className="font-medium text-slate-800">{p.paymentMode}</span>
-                      {p.transactionReference && (
-                        <span className="block font-mono text-[11px] text-slate-500">
-                          Ref: {p.transactionReference}
-                        </span>
-                      )}
-                    </td>
-                    <td className="px-4 py-3 font-mono tabular-nums text-slate-600">
-                      {p.periodStart} → {p.periodEnd}
-                    </td>
-                    <td className="px-4 py-3 font-mono tabular-nums text-right font-medium text-slate-900">
-                      {formatCurrency(p.amount)}
-                    </td>
-                    <td className="px-4 py-3">
-                      <StatusLabel
-                        status={p.status}
-                        label={
-                          p.status === SubscriptionPaymentStatus.RECORDED
-                            ? 'Recorded (Unverified)'
-                            : p.status
-                        }
-                      />
-                    </td>
-                    <td className="px-4 py-3 text-right">
-                      {p.status === SubscriptionPaymentStatus.RECORDED && !p.extensionApplied ? (
-                        <button
-                          type="button"
-                          disabled={busy}
-                          onClick={() => handleVerify(p.id)}
-                          className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-emerald-700 border border-emerald-200 bg-emerald-50 rounded hover:bg-emerald-100 cursor-pointer"
-                        >
-                          <CheckCircle2 className="w-3.5 h-3.5" />
-                          Verify & Extend
-                        </button>
-                      ) : (
-                        <span className="text-[11px] text-slate-400">
-                          {p.extensionApplied ? 'Extension applied' : '—'}
-                        </span>
-                      )}
-                    </td>
-                  </tr>
-                ))}
+                {paginated.map((p) => {
+                  const canProcess =
+                    (p.status === SubscriptionPaymentStatus.RECORDED ||
+                      p.status === SubscriptionPaymentStatus.PENDING) &&
+                    !p.extensionApplied;
+                  return (
+                    <tr key={p.id} className="hover:bg-slate-50">
+                      <td className="px-4 py-3 font-mono tabular-nums text-slate-700">
+                        {formatDisplayDate(p.paymentDate)}
+                      </td>
+                      <td className="px-4 py-3 font-medium text-slate-900">{p.gymName}</td>
+                      <td className="px-4 py-3 text-slate-700">{p.planName}</td>
+                      <td className="px-4 py-3">
+                        <span className="font-medium text-slate-800">{p.paymentMode}</span>
+                        {p.transactionReference && (
+                          <span className="block font-mono text-[11px] text-slate-500">
+                            Ref: {p.transactionReference}
+                          </span>
+                        )}
+                      </td>
+                      <td className="px-4 py-3 font-mono tabular-nums text-slate-600">
+                        {p.periodStart} → {p.periodEnd}
+                      </td>
+                      <td className="px-4 py-3 font-mono tabular-nums text-right font-medium text-slate-900">
+                        {formatCurrency(p.amount)}
+                      </td>
+                      <td className="px-4 py-3">
+                        <StatusLabel
+                          status={p.status}
+                          label={
+                            p.status === SubscriptionPaymentStatus.RECORDED
+                              ? 'Recorded (Unverified)'
+                              : p.status === SubscriptionPaymentStatus.PENDING
+                                ? 'Pending Verification'
+                                : p.status
+                          }
+                        />
+                        {p.notes && p.status === SubscriptionPaymentStatus.REJECTED && (
+                          <span className="block text-[11px] text-red-600 mt-0.5 max-w-xs truncate">
+                            {p.notes}
+                          </span>
+                        )}
+                      </td>
+                      <td className="px-4 py-3 text-right whitespace-nowrap">
+                        {canProcess ? (
+                          <div className="inline-flex items-center gap-1.5">
+                            <button
+                              type="button"
+                              disabled={busy}
+                              onClick={() => handleVerify(p.id)}
+                              className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-emerald-700 border border-emerald-200 bg-emerald-50 rounded hover:bg-emerald-100 cursor-pointer"
+                            >
+                              <CheckCircle2 className="w-3.5 h-3.5" />
+                              Verify &amp; Extend
+                            </button>
+                            <button
+                              type="button"
+                              disabled={busy}
+                              onClick={() => setRejectingPayment(p)}
+                              className="p-1.5 text-red-600 hover:bg-red-50 rounded cursor-pointer"
+                              title="Reject subscription payment"
+                            >
+                              <XCircle className="w-3.5 h-3.5" />
+                            </button>
+                          </div>
+                        ) : (
+                          <span className="text-[11px] text-slate-400">
+                            {p.extensionApplied ? 'Extension applied' : '—'}
+                          </span>
+                        )}
+                      </td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>
         )}
+        <Pagination
+          page={currentPage}
+          pageSize={PAGE_SIZE}
+          totalItems={filtered.length}
+          onPageChange={setPage}
+        />
       </div>
 
       <Modal
@@ -285,7 +373,9 @@ export const SubscriptionPaymentsView: React.FC<SubscriptionPaymentsViewProps> =
               />
             </div>
             <div className="col-span-2">
-              <label className="block text-xs font-medium text-slate-700 mb-1">Transaction Reference</label>
+              <label className="block text-xs font-medium text-slate-700 mb-1">
+                Transaction Reference
+              </label>
               <input
                 type="text"
                 value={txRef}
@@ -350,6 +440,20 @@ export const SubscriptionPaymentsView: React.FC<SubscriptionPaymentsViewProps> =
           </div>
         </form>
       </Modal>
+
+      <ConfirmModal
+        open={Boolean(rejectingPayment)}
+        title={`Reject Subscription Payment · ${rejectingPayment?.gymName || ''}`}
+        description={`Reject unverified ${rejectingPayment?.paymentMode || ''} payment of ${formatCurrency(rejectingPayment?.amount ?? 0)}. No subscription extension will be applied.`}
+        confirmLabel="Reject Payment"
+        variant="danger"
+        requireReason
+        reasonLabel="Rejection Reason"
+        reasonPlaceholder="e.g. UTR mismatch or transaction reversed"
+        defaultReason="Transaction not verified in bank statement"
+        onConfirm={handleRejectConfirm}
+        onCancel={() => setRejectingPayment(null)}
+      />
     </div>
   );
 };

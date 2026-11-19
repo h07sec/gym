@@ -19,6 +19,7 @@ import {
   AccountStatus,
   AuditLog,
   Gym,
+  PlatformAdmin,
   PlatformNotification,
   SubscriptionPayment,
   SubscriptionPlan,
@@ -46,6 +47,7 @@ export const SuperAdminShell: React.FC = () => {
   const [payments, setPayments] = useState<SubscriptionPayment[]>([]);
   const [notifications, setNotifications] = useState<PlatformNotification[]>([]);
   const [auditLogs, setAuditLogs] = useState<AuditLog[]>([]);
+  const [platformAdmins, setPlatformAdmins] = useState<PlatformAdmin[]>([]);
 
   const [showQuickLaunch, setShowQuickLaunch] = useState(false);
   const [launchName, setLaunchName] = useState('');
@@ -85,6 +87,11 @@ export const SuperAdminShell: React.FC = () => {
         query(collection(db, 'audit_logs'), orderBy('createdAt', 'desc')),
         (snap) => setAuditLogs(snap.docs.map((d) => d.data() as AuditLog)),
         (err) => handleFirestoreError(err, OperationType.LIST, 'audit_logs')
+      ),
+      onSnapshot(
+        collection(db, 'platform_admins'),
+        (snap) => setPlatformAdmins(snap.docs.map((d) => d.data() as PlatformAdmin)),
+        (err) => handleFirestoreError(err, OperationType.LIST, 'platform_admins')
       ),
     ];
     return () => unsubs.forEach((u) => u());
@@ -292,7 +299,11 @@ export const SuperAdminShell: React.FC = () => {
             />
           )}
           {tab === 'settings' && (
-            <PlatformSettingsView actor={actor} settings={platformSettings} />
+            <PlatformSettingsView
+              actor={actor}
+              settings={platformSettings}
+              platformAdmins={platformAdmins}
+            />
           )}
           {tab === 'audit' && <AuditLogsView logs={auditLogs} />}
         </main>

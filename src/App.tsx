@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { ArrowLeft, Building2, ShieldAlert } from 'lucide-react';
+import { ArrowLeft, Building2, KeyRound, ShieldAlert } from 'lucide-react';
 import { AuthProvider, useAuth } from './contexts/AuthContext';
 import { ErrorBoundary } from './components/common/ErrorBoundary';
 import { GymAuthScreen } from './components/auth/GymAuthScreen';
@@ -8,7 +8,11 @@ import { OnboardingWizard } from './components/auth/OnboardingWizard';
 import { SuspendedScreen } from './components/auth/SuspendedScreen';
 import { SuperAdminShell } from './components/super-admin/SuperAdminShell';
 import { GymShell } from './components/gym/GymShell';
-import { AccountStatus, UserRole, UserStatus } from './types/gymos';
+import { UserRole, UserStatus } from './types/gymos';
+import {
+  fetchServerNotificationCapabilities,
+  type ServerCapabilities,
+} from './services/gymos-service';
 
 function checkIsAdminRoute(): boolean {
   if (typeof window === 'undefined') return false;
@@ -45,7 +49,7 @@ const AdminWorkspaceBanner: React.FC<{ onReturnToAdmin: () => void }> = ({
           >
             {availableGyms.map((g) => (
               <option key={g.id} value={g.id}>
-                {g.name} ({g.accountStatus})
+                {g.name} ({g.accountStatus} / {g.subscriptionStatus})
               </option>
             ))}
           </select>
@@ -66,13 +70,128 @@ const AdminWorkspaceBanner: React.FC<{ onReturnToAdmin: () => void }> = ({
   );
 };
 
+const AdminAccessGate: React.FC<{
+  onGoToGymPortal: () => void;
+}> = ({ onGoToGymPortal }) => {
+  const { firebaseUser, signOut, refreshProfile } = useAuth();
+  const [capabilities, setCapabilities] = useState<ServerCapabilities | null>(null);
+  const [bootstrapToken, setBootstrapToken] = useState('');
+  const [bootstrapping, setBootstrapping] = useState(false);
+  const [bootstrapError, setBootstrapError] = useState<string | null>(null);
+
+  useEffect(() => {
+    fetchServerNotificationCapabilities().then(setCapabilities);
+  }, []);
+
+  const handleBootstrap = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!firebaseUser || !bootstrapToken.trim()) return;
+    setBootstrapping(true);
+    setBootstrapError(null);
+    try {
+      const idToken = await firebaseUser.getIdToken();
+      const resp = await fetch('/api/admin/bootstrap', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${idToken}`,
+        },
+        body: JSON.stringify({
+          bootstrapToken: bootstrapToken.trim(),
+          displayName: firebaseUser.displayName || undefined,
+        }),
+      });
+      const json = (await resp.json().catch(() => ({}))) as {
+        ok?: boolean;
+        error?: string;
+      };
+      if (!resp.ok || !json.ok) {
+        setBootstrapError(json.error || `Bootstrap failed (HTTP ${resp.status}).`);
+        return;
+      }
+      await refreshProfile();
+    } catch (err) {
+      setBootstrapError(err instanceof Error ? err.message : 'Bootstrap request failed.');
+    } finally {
+      setBootstrapping(false);
+    }
+  };
+
+  return (
+    <div className="min-h-screen bg-slate-950 flex items-center justify-center p-6">
+      <div className="max-w-md w-full bg-slate-900 border border-slate-800 rounded-lg p-7 space-y-5">
+        <div className="flex items-center gap-3 text-red-400">
+          <ShieldAlert className="w-5 h-5 shrink-0" />
+          <h1 className="text-base font-semibold text-white">
+            Administrator Access Required
+          </h1>
+        </div>
+        <p className="text-xs text-slate-400 leading-relaxed">
+          Signed in as <span className="text-slate-200">{firebaseUser?.email}</span>. This console is restricted to authorized GymOS platform administrators.
+        </p>
+
+        {capabilities?.adminBootstrapConfigured && (
+          <form
+            onSubmit={handleBootstrap}
+            className="border-t border-slate-800 pt-4 space-y-3"
+          >
+            <div className="flex items-center gap-2 text-xs font-medium text-teal-400">
+              <KeyRound className="w-4 h-4" />
+              <span>Initial Platform Admin Activation</span>
+            </div>
+            {bootstrapError && (
+              <div className="p-2.5 bg-red-950/60 border border-red-900 rounded text-xs text-red-300">
+                {bootstrapError}
+              </div>
+            )}
+            <input
+              type="password"
+              required
+              value={bootstrapToken}
+              onChange={(e) => setBootstrapToken(e.target.value)}
+              placeholder="Enter server bootstrap token"
+              className="w-full px-3 py-2 text-xs bg-slate-950 border border-slate-700 text-white rounded-md focus:outline-none focus:ring-2 focus:ring-teal-600"
+            />
+            <button
+              type="submit"
+              disabled={bootstrapping}
+              className="w-full px-4 py-2 text-xs font-medium text-white bg-teal-700 rounded-md hover:bg-teal-600 disabled:opacity-50 cursor-pointer"
+            >
+              {bootstrapping ? 'Activating Super Admin...' : 'Initialize Platform Admin'}
+            </button>
+          </form>
+        )}
+
+        <div className="flex flex-wrap items-center gap-3 pt-2 border-t border-slate-800">
+          <button
+            type="button"
+            onClick={onGoToGymPortal}
+            className="px-4 py-2 text-xs font-medium text-white bg-teal-700 rounded-md hover:bg-teal-600 cursor-pointer"
+          >
+            Go to Gym Portal
+          </button>
+          <button
+            type="button"
+            onClick={signOut}
+            className="px-4 py-2 text-xs font-medium text-slate-300 border border-slate-700 rounded-md hover:bg-slate-800 cursor-pointer"
+          >
+            Sign out
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+};
+
 const GymOSRouter: React.FC = () => {
   const {
     firebaseUser,
     profile,
     gym,
+    subscriptionAccess,
     availableGyms,
     superAdminGymId,
+    staffRecord,
     loading,
     enterGymWorkspace,
     signOut,
@@ -113,38 +232,8 @@ const GymOSRouter: React.FC = () => {
   }
 
   if (isAdminRoute) {
-    if (profile?.role !== UserRole.SUPER_ADMIN) {
-      return (
-        <div className="min-h-screen bg-slate-950 flex items-center justify-center p-6">
-          <div className="max-w-md w-full bg-slate-900 border border-slate-800 rounded-lg p-7 space-y-5">
-            <div className="flex items-center gap-3 text-red-400">
-              <ShieldAlert className="w-5 h-5 shrink-0" />
-              <h1 className="text-base font-semibold text-white">
-                Administrator Access Required
-              </h1>
-            </div>
-            <p className="text-xs text-slate-400 leading-relaxed">
-              This portal is restricted to authorized GymOS platform administrators. Use the Gym Owner &amp; Staff portal to access your gym workspace.
-            </p>
-            <div className="flex flex-wrap items-center gap-3 pt-1">
-              <button
-                type="button"
-                onClick={() => navigateTo('/')}
-                className="px-4 py-2 text-xs font-medium text-white bg-teal-700 rounded-md hover:bg-teal-600 cursor-pointer"
-              >
-                Go to Gym Portal
-              </button>
-              <button
-                type="button"
-                onClick={signOut}
-                className="px-4 py-2 text-xs font-medium text-slate-300 border border-slate-700 rounded-md hover:bg-slate-800 cursor-pointer"
-              >
-                Sign out
-              </button>
-            </div>
-          </div>
-        </div>
-      );
+    if (profile?.role !== UserRole.SUPER_ADMIN || profile?.status !== UserStatus.ACTIVE) {
+      return <AdminAccessGate onGoToGymPortal={() => navigateTo('/')} />;
     }
 
     if (superAdminGymId && gym) {
@@ -152,7 +241,7 @@ const GymOSRouter: React.FC = () => {
         <div className="min-h-screen flex flex-col">
           <AdminWorkspaceBanner onReturnToAdmin={() => navigateTo('/admin')} />
           <div className="flex-1 flex flex-col">
-            {gym.accountStatus === AccountStatus.SUSPENDED ? <SuspendedScreen /> : <GymShell />}
+            {subscriptionAccess?.isLocked ? <SuspendedScreen /> : <GymShell />}
           </div>
         </div>
       );
@@ -165,7 +254,14 @@ const GymOSRouter: React.FC = () => {
     return <OnboardingWizard />;
   }
 
-  if (profile.status === UserStatus.DEACTIVATED) {
+  const isStaffDeactivated =
+    profile.status === UserStatus.DEACTIVATED ||
+    (profile.role !== UserRole.SUPER_ADMIN &&
+      profile.role !== UserRole.GYM_OWNER &&
+      staffRecord !== null &&
+      staffRecord.status === UserStatus.DEACTIVATED);
+
+  if (isStaffDeactivated) {
     return (
       <div className="min-h-screen bg-[#F8FAFC] flex items-center justify-center p-6">
         <div className="max-w-md w-full bg-white border border-slate-200 rounded-lg p-6 space-y-4">
@@ -193,7 +289,7 @@ const GymOSRouter: React.FC = () => {
         <div className="min-h-screen flex flex-col">
           <AdminWorkspaceBanner onReturnToAdmin={() => navigateTo('/admin')} />
           <div className="flex-1 flex flex-col">
-            {gym.accountStatus === AccountStatus.SUSPENDED ? <SuspendedScreen /> : <GymShell />}
+            {subscriptionAccess?.isLocked ? <SuspendedScreen /> : <GymShell />}
           </div>
         </div>
       );
@@ -220,7 +316,9 @@ const GymOSRouter: React.FC = () => {
                   className="w-full text-left px-3.5 py-2.5 border border-slate-200 rounded-md hover:border-teal-700 hover:bg-teal-50/30 flex items-center justify-between text-xs cursor-pointer"
                 >
                   <span className="font-medium text-slate-900">{g.name}</span>
-                  <span className="text-slate-500">{g.accountStatus}</span>
+                  <span className="text-slate-500">
+                    {g.accountStatus} · {g.subscriptionStatus}
+                  </span>
                 </button>
               ))}
             </div>
@@ -254,7 +352,7 @@ const GymOSRouter: React.FC = () => {
     );
   }
 
-  if (gym.accountStatus === AccountStatus.SUSPENDED) {
+  if (subscriptionAccess?.isLocked) {
     return <SuspendedScreen />;
   }
 

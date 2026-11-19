@@ -1,19 +1,39 @@
 # GymOS Super Admin Setup & Security Governance
 
-## 1. Bootstrapping the First Super Admin
+GymOS separates the **Platform Super Admin Portal** (`/admin`) from the **Gym Owner & Staff Portal** (`/`) and enforces authorization inside `firestore.rules` using the `/platform_admins/{uid}` registry—never via hardcoded email addresses.
 
-GymOS prevents any regular user or gym owner from self-promoting to `SUPER_ADMIN`.
-- In `firestore.rules`, `isBootstrapSuperAdmin()` verifies `request.auth.token.email_verified == true` and matches the designated platform owner email.
-- On first authenticated Google sign-in, `AuthContext.tsx` registers `/platform_admins/{uid}` and `/users/{uid}` with `role: 'SUPER_ADMIN'` and seeds default SaaS subscription plans (`Monthly Standard`, `Quarterly Growth`, `Half-Yearly Scale`, `Yearly Studio`) and `platform_settings/default`.
-- On PostgreSQL/Supabase, insert the initial Super Admin UUID into `platform_admins` and `users` via a privileged `psql` migration session before opening public signup.
+## 1. Controlled Super Admin Bootstrap (First Admin)
 
-## 2. Managing Gyms & Account Freeze Governance
+Regular users and gym owners cannot create `/platform_admins/{uid}` records or assign themselves `role: 'SUPER_ADMIN'` in `/users/{uid}`. Use either of the two controlled bootstrap paths on a fresh deployment:
 
-- **Suspending a Gym**: From **Gyms Management**, click **Suspend** and provide a reason. Setting `accountStatus = 'SUSPENDED'` immediately enforces a database-level lock (`isGymActive(gymId)` in Firestore rules / `app_is_gym_active(gym_id)` in PostgreSQL RLS).
-- **Data Preservation**: All members, memberships, payments, and receipts remain untouched in the database during suspension.
-- **Reactivation**: Verify a manual subscription payment or click **Reactivate** in Gyms Management to restore immediate access.
+### Option A: CLI Bootstrap (`scripts/init-super-admin.mjs`)
+1. Ensure the target user has signed in at least once with Google / Email-verified Firebase Authentication so their user record exists in Firebase Auth.
+2. Provide Firebase Admin credentials (`FIREBASE_SERVICE_ACCOUNT_JSON` or `GOOGLE_APPLICATION_CREDENTIALS`) in your shell or `.env`.
+3. Run:
+   ```bash
+   node scripts/init-super-admin.mjs admin@yourdomain.com "Platform Admin"
+   ```
+   This atomically writes `/platform_admins/{uid}`, `/users/{uid}` (`role: 'SUPER_ADMIN'`), and an immutable `CLI_INIT_SUPER_ADMIN` audit log entry.
 
-## 3. Manual Cash & UPI Verification Rules
+### Option B: Web Bootstrap Endpoint (`POST /api/admin/bootstrap`)
+1. Set a high-entropy one-time token in `SUPER_ADMIN_BOOTSTRAP_TOKEN` and configure `FIREBASE_SERVICE_ACCOUNT_JSON` (or `GOOGLE_APPLICATION_CREDENTIALS`) on the server.
+2. Open `/admin`, sign in with your verified Google account, and enter the bootstrap token when prompted.
+3. Once the first Super Admin exists in `/platform_admins`, `POST /api/admin/bootstrap` automatically locks (`HTTP 409`) so no unauthorized caller can reuse the token. Remove `SUPER_ADMIN_BOOTSTRAP_TOKEN` from `.env` afterward.
 
-- Always record or verify the UTR / Transaction Reference for UPI settlements; GymOS rejects duplicate non-rejected UPI references.
-- Subscription payments move from `RECORDED` -> `VERIFIED` once inside an atomic transaction (`verifyExistingSubscriptionPayment`) with `extensionApplied = true`, preventing double extension on retries or clicks.
+## 2. Managing Additional Super Admins
+
+Once logged into `/admin`, open **Platform Settings -> Platform Super Administrators Registry** to grant or revoke `SUPER_ADMIN` access for existing authenticated users by UID and verified email. An active Super Admin cannot delete their own `/platform_admins/{uid}` document, preventing accidental platform lockout.
+
+## 3. Public Registration Controls & Admin-Provisioned Gyms
+
+- `platform_settings/default.allowPublicRegistration` is enforced directly in `firestore.rules` (not only in frontend UI).
+- When `allowPublicRegistration` is `false`, direct self-signup creation of `/gyms/{gymId}` and self-registered `/users/{uid}` is rejected by Firestore.
+- Super Admins can always provision new gyms from **Gyms Management -> Create Gym**, which creates the gym with `ownerUid: "owner_pending_<invitationId>"` and issues a `GYM_OWNER` invitation. When the invited owner signs in with their matching verified email, they claim ownership atomically via `claimOwnerInvitation`.
+
+## 4. Account Freeze, Grace Period & Manual Subscription Verification
+
+- **Database-Level Lock**: `isGymActive(gymId)` in `firestore.rules` requires `accountStatus == 'ACTIVE'`, `subscriptionStatus in ['TRIAL', 'ACTIVE']`, and `subscriptionAccessUntil > request.time`.
+- **Grace Period**: Subscription expiry access extends through `subscriptionEndAt + gracePeriodDays` (`subscriptionAccessUntil`). Super Admins can adjust `gracePeriodDays` per gym from **Gyms Management**.
+- **Manual Cash & UPI Verification**:
+  - Super Admins can record direct verified payments or verify/reject `PENDING` / `RECORDED` subscription payments from **Subscription Payments**.
+  - `verifyExistingSubscriptionPayment` runs inside a Firestore transaction and requires `extensionApplied == false`, preventing duplicate period extensions.

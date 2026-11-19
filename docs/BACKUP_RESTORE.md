@@ -1,8 +1,10 @@
 # GymOS Backup & Restore Runbook
 
-## 1. Firestore Backup & Restore (Google Cloud)
+GymOS supports both **platform-wide Cloud Firestore backups** (for platform operators) and **per-tenant JSON Backup & Restore** (built directly into each gym's Settings screen).
 
-1. Export all collections to a Google Cloud Storage bucket:
+## 1. Platform-Wide Firestore Backup & Restore (Google Cloud)
+
+1. Export all collections in the configured Firestore database (`ai-studio-41ae310f-363a-4e9f-a08f-b95b76f8f4e9`) to a Google Cloud Storage bucket:
    ```bash
    gcloud firestore exports gs://YOUR_BACKUP_BUCKET/gymos-$(date +%F) \
      --database="ai-studio-41ae310f-363a-4e9f-a08f-b95b76f8f4e9"
@@ -12,27 +14,18 @@
    gcloud firestore import gs://YOUR_BACKUP_BUCKET/gymos-YYYY-MM-DD \
      --database="ai-studio-41ae310f-363a-4e9f-a08f-b95b76f8f4e9"
    ```
-3. Also encourage gym owners to export periodic CSV snapshots from **Members** and **Reports** for offline bookkeeping.
-
-## 2. PostgreSQL / Docker Backup & Restore
-
-### Daily Automated Backup (`pg_dump`)
-```bash
-pg_dump "$DATABASE_URL" --format=custom --no-owner --file="gymos_backup_$(date +%F_%H%M).dump"
-```
-Inside Docker Compose:
-```bash
-docker compose exec -T gymos-postgres pg_dump -U gymos_app -d gymos -Fc > "gymos_backup_$(date +%F).dump"
-```
-
-### Point-in-Time / Full Restore (`pg_restore`)
-1. Provision a clean database and verify extensions (`pgcrypto`).
-2. Restore schema, RLS policies, and data:
+3. After any rules or deployment restore, verify `firestore.rules` is active:
    ```bash
-   pg_restore --clean --if-exists --no-owner --dbname="$DATABASE_URL" gymos_backup_YYYY-MM-DD.dump
+   bun run lint:rules
+   firebase deploy --only firestore:rules
    ```
-3. Verify RLS is enabled on every tenant table:
-   ```sql
-   SELECT tablename, rowsecurity FROM pg_tables WHERE schemaname = 'public';
-   ```
-   All 18 tables must report `rowsecurity = true`.
+
+## 2. Per-Tenant JSON Backup & Restore (Gym Owner UI)
+
+Each Gym Owner can export and restore their own isolated gym data from **Settings -> Tenant Data Backup & Restore**:
+
+- **Download Full Backup (JSON)**: Exports `settings`, `membershipPlans`, `members`, `memberships`, `memberPayments`, `paymentReceipts`, `attendance`, and `notificationLogs` into a single JSON file stamped with `gymId` and `exportedAt`.
+- **Restore from JSON**:
+  - Validates `gymId` in the backup file against the active gym so cross-tenant imports are strictly rejected.
+  - Merges records safely into the active tenant's subcollections in chunked Firestore batches (`merge: true`) and logs a `RESTORE_GYM_BACKUP` entry in `/audit_logs`.
+- **CSV Snapshots**: Gym owners and authorized staff can also export member lists from **Members** and financial/operational summaries from **Reports** (`Daily`, `Weekly`, `Monthly`, `Custom Range`, `Outstanding Balances`, `Expiring Memberships`).

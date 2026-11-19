@@ -6,6 +6,7 @@ import {
   MemberPaymentStatus,
   Membership,
   MembershipActionType,
+  MembershipRecordStatus,
   MembershipStatus,
   PaymentMode,
   SubscriptionPayment,
@@ -13,7 +14,7 @@ import {
   SubscriptionPlan,
   SubscriptionStatus,
 } from '../../types/gymos';
-import { deriveMemberMembershipStatus } from './dates';
+import { addDaysSafe, deriveMemberMembershipStatus, diffDays } from './dates';
 
 export interface GymDashboardMetrics {
   totalMembers: number;
@@ -49,6 +50,21 @@ export interface DailyReportSummary {
   totalConfirmedCollections: number;
 }
 
+export interface RangeReportSummary {
+  startDate: string;
+  endDate: string;
+  totalRevenue: number;
+  cashRevenue: number;
+  upiRevenue: number;
+  confirmedPaymentsCount: number;
+  pendingPaymentsCount: number;
+  pendingPaymentsAmount: number;
+  newMembers: number;
+  renewals: number;
+  cancellations: number;
+  planPerformance: { planName: string; count: number; revenue: number }[];
+}
+
 export interface MonthlyReportSummary {
   monthKey: string;
   totalRevenue: number;
@@ -59,6 +75,31 @@ export interface MonthlyReportSummary {
   cancellations: number;
   outstandingBalances: number;
   planPerformance: { planName: string; count: number; revenue: number }[];
+}
+
+export interface OutstandingBalanceRow {
+  memberId: string;
+  memberCode: string;
+  fullName: string;
+  phone: string;
+  currentPlanName: string;
+  membershipExpiryDate: string;
+  membershipStatus: MembershipStatus;
+  outstandingBalance: number;
+  dueDate: string;
+  daysOverdue: number;
+}
+
+export interface ExpiringMembershipRow {
+  memberId: string;
+  memberCode: string;
+  fullName: string;
+  phone: string;
+  email: string;
+  currentPlanName: string;
+  membershipExpiryDate: string;
+  daysRemaining: number;
+  outstandingBalance: number;
 }
 
 export function computeGymDashboardMetrics(
@@ -77,6 +118,11 @@ export function computeGymDashboardMetrics(
   let newMembersThisMonth = 0;
 
   for (const m of activeRecords) {
+    if (m.membershipStatus === MembershipStatus.CANCELLED) {
+      totalOutstandingFees += Math.max(0, Number(m.outstandingBalance) || 0);
+      if ((m.joiningDate || '').startsWith(monthPrefix)) newMembersThisMonth += 1;
+      continue;
+    }
     const derived = deriveMemberMembershipStatus(m.membershipExpiryDate, referenceDateIso, 7);
     if (derived === MembershipStatus.ACTIVE) {
       activeMembers += 1;
@@ -114,6 +160,7 @@ export function computeGymDashboardMetrics(
   const renewalsThisMonth = memberships.filter(
     (ms) =>
       ms.actionType === MembershipActionType.RENEWAL &&
+      ms.status !== MembershipRecordStatus.CANCELLED &&
       (ms.startDate || '').startsWith(monthPrefix)
   ).length;
 
@@ -148,7 +195,11 @@ export function computeMonthlyTrends(
     const y = dt.getUTCFullYear();
     const m = String(dt.getUTCMonth() + 1).padStart(2, '0');
     const key = `${y}-${m}`;
-    const label = dt.toLocaleDateString('en-US', { month: 'short', year: '2-digit', timeZone: 'UTC' });
+    const label = dt.toLocaleDateString('en-US', {
+      month: 'short',
+      year: '2-digit',
+      timeZone: 'UTC',
+    });
 
     const revenue = payments
       .filter((p) => p.status === MemberPaymentStatus.CONFIRMED && p.paymentDate.startsWith(key))
@@ -184,6 +235,7 @@ export function computeDailyReport(
   let expiringSoonMembers = 0;
 
   for (const m of activeRecords) {
+    if (m.membershipStatus === MembershipStatus.CANCELLED) continue;
     const st = deriveMemberMembershipStatus(m.membershipExpiryDate, targetDateIso, 7);
     if (st === MembershipStatus.ACTIVE) activeMembers += 1;
     else if (st === MembershipStatus.EXPIRING_SOON) {
@@ -215,6 +267,73 @@ export function computeDailyReport(
   };
 }
 
+export function computeDateRangeReport(
+  members: Member[],
+  payments: MemberPayment[],
+  memberships: Membership[],
+  startDateIso: string,
+  endDateIso: string
+): RangeReportSummary {
+  const inRange = (dt?: string) => Boolean(dt && dt >= startDateIso && dt <= endDateIso);
+  const rangePayments = payments.filter((p) => inRange(p.paymentDate));
+  const confirmed = rangePayments.filter((p) => p.status === MemberPaymentStatus.CONFIRMED);
+  const pending = rangePayments.filter((p) => p.status === MemberPaymentStatus.PENDING);
+
+  const cashRevenue = confirmed
+    .filter((p) => p.paymentMode === PaymentMode.CASH)
+    .reduce((s, p) => s + p.amount, 0);
+  const upiRevenue = confirmed
+    .filter((p) => p.paymentMode === PaymentMode.UPI)
+    .reduce((s, p) => s + p.amount, 0);
+
+  const rangeMemberships = memberships.filter((m) => inRange(m.startDate));
+  const membershipById = new Map(memberships.map((ms) => [ms.id, ms]));
+  const planMap = new Map<string, { planName: string; count: number; revenue: number }>();
+
+  for (const ms of rangeMemberships) {
+    const prev = planMap.get(ms.planName) ?? { planName: ms.planName, count: 0, revenue: 0 };
+    prev.count += 1;
+    planMap.set(ms.planName, prev);
+  }
+
+  for (const p of confirmed) {
+    const ms = p.membershipId ? membershipById.get(p.membershipId) : undefined;
+    const key = ms?.planName || 'General / Settlement';
+    const prev = planMap.get(key) ?? { planName: key, count: 0, revenue: 0 };
+    prev.revenue += p.amount;
+    planMap.set(key, prev);
+  }
+
+  return {
+    startDate: startDateIso,
+    endDate: endDateIso,
+    totalRevenue: Number((cashRevenue + upiRevenue).toFixed(2)),
+    cashRevenue: Number(cashRevenue.toFixed(2)),
+    upiRevenue: Number(upiRevenue.toFixed(2)),
+    confirmedPaymentsCount: confirmed.length,
+    pendingPaymentsCount: pending.length,
+    pendingPaymentsAmount: Number(pending.reduce((s, p) => s + p.amount, 0).toFixed(2)),
+    newMembers: members.filter((m) => !m.isArchived && inRange(m.joiningDate)).length,
+    renewals: rangeMemberships.filter((m) => m.actionType === MembershipActionType.RENEWAL).length,
+    cancellations: memberships.filter(
+      (m) => m.status === MembershipRecordStatus.CANCELLED && inRange(m.cancelledAt || m.startDate)
+    ).length,
+    planPerformance: Array.from(planMap.values())
+      .map((r) => ({ ...r, revenue: Number(r.revenue.toFixed(2)) }))
+      .sort((a, b) => b.revenue - a.revenue),
+  };
+}
+
+export function computeWeeklyReport(
+  members: Member[],
+  payments: MemberPayment[],
+  memberships: Membership[],
+  endDateIso: string
+): RangeReportSummary {
+  const startDateIso = addDaysSafe(endDateIso, -6);
+  return computeDateRangeReport(members, payments, memberships, startDateIso, endDateIso);
+}
+
 export function computeMonthlyReport(
   members: Member[],
   payments: MemberPayment[],
@@ -232,12 +351,21 @@ export function computeMonthlyReport(
     .reduce((s, p) => s + p.amount, 0);
 
   const monthMemberships = memberships.filter((m) => m.startDate.startsWith(monthKey));
+  const membershipById = new Map(memberships.map((ms) => [ms.id, ms]));
   const planMap = new Map<string, { planName: string; count: number; revenue: number }>();
+
   for (const ms of monthMemberships) {
     const prev = planMap.get(ms.planName) ?? { planName: ms.planName, count: 0, revenue: 0 };
     prev.count += 1;
-    prev.revenue += ms.amountPaid;
     planMap.set(ms.planName, prev);
+  }
+
+  for (const p of confirmed) {
+    const ms = p.membershipId ? membershipById.get(p.membershipId) : undefined;
+    const key = ms?.planName || 'Balance Settlement / Other';
+    const prev = planMap.get(key) ?? { planName: key, count: 0, revenue: 0 };
+    prev.revenue += p.amount;
+    planMap.set(key, prev);
   }
 
   return {
@@ -248,7 +376,7 @@ export function computeMonthlyReport(
     newMembers: members.filter((m) => !m.isArchived && m.joiningDate.startsWith(monthKey)).length,
     renewals: monthMemberships.filter((m) => m.actionType === MembershipActionType.RENEWAL).length,
     cancellations: memberships.filter(
-      (m) => m.status === 'CANCELLED' && m.startDate.startsWith(monthKey)
+      (m) => m.status === MembershipRecordStatus.CANCELLED && (m.cancelledAt || m.startDate).startsWith(monthKey)
     ).length,
     outstandingBalances: Number(
       members
@@ -256,8 +384,69 @@ export function computeMonthlyReport(
         .reduce((s, m) => s + Math.max(0, m.outstandingBalance), 0)
         .toFixed(2)
     ),
-    planPerformance: Array.from(planMap.values()).sort((a, b) => b.revenue - a.revenue),
+    planPerformance: Array.from(planMap.values())
+      .map((r) => ({ ...r, revenue: Number(r.revenue.toFixed(2)) }))
+      .sort((a, b) => b.revenue - a.revenue),
   };
+}
+
+export function computeOutstandingBalancesReport(
+  members: Member[],
+  memberships: Membership[],
+  todayIso: string
+): OutstandingBalanceRow[] {
+  return members
+    .filter((m) => !m.isArchived && (Number(m.outstandingBalance) || 0) > 0)
+    .map((m) => {
+      const activeDue = memberships.find(
+        (ms) => ms.memberId === m.id && ms.status === MembershipRecordStatus.ACTIVE && ms.dueDate
+      );
+      const dueDate = activeDue?.dueDate || m.membershipExpiryDate || m.joiningDate;
+      const daysOverdue = dueDate && dueDate < todayIso ? Math.abs(diffDays(todayIso, dueDate)) : 0;
+      const derivedStatus =
+        m.membershipStatus === MembershipStatus.CANCELLED
+          ? MembershipStatus.CANCELLED
+          : deriveMemberMembershipStatus(m.membershipExpiryDate, todayIso, 7);
+      return {
+        memberId: m.id,
+        memberCode: m.memberCode,
+        fullName: m.fullName,
+        phone: m.phone,
+        currentPlanName: m.currentPlanName || 'No Plan',
+        membershipExpiryDate: m.membershipExpiryDate || '',
+        membershipStatus: derivedStatus,
+        outstandingBalance: Number((Number(m.outstandingBalance) || 0).toFixed(2)),
+        dueDate: dueDate || '',
+        daysOverdue,
+      };
+    })
+    .sort((a, b) => b.outstandingBalance - a.outstandingBalance);
+}
+
+export function computeExpiringMembershipsReport(
+  members: Member[],
+  todayIso: string,
+  withinDays = 14
+): ExpiringMembershipRow[] {
+  return members
+    .filter((m) => {
+      if (m.isArchived || !m.membershipExpiryDate) return false;
+      if (m.membershipStatus === MembershipStatus.CANCELLED) return false;
+      const rem = diffDays(todayIso, m.membershipExpiryDate);
+      return rem >= -30 && rem <= withinDays;
+    })
+    .map((m) => ({
+      memberId: m.id,
+      memberCode: m.memberCode,
+      fullName: m.fullName,
+      phone: m.phone,
+      email: m.email || '',
+      currentPlanName: m.currentPlanName || 'Plan',
+      membershipExpiryDate: m.membershipExpiryDate || '',
+      daysRemaining: diffDays(todayIso, m.membershipExpiryDate || todayIso),
+      outstandingBalance: Number((Number(m.outstandingBalance) || 0).toFixed(2)),
+    }))
+    .sort((a, b) => a.daysRemaining - b.daysRemaining);
 }
 
 export interface PlatformOverviewMetrics {

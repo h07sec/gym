@@ -9,6 +9,7 @@ import {
   Trash2,
   Eye,
   Edit2,
+  Ban,
 } from 'lucide-react';
 import {
   Gym,
@@ -18,6 +19,7 @@ import {
   Membership,
   MembershipActionType,
   MembershipPlan,
+  MembershipRecordStatus,
   MembershipStatus,
   PaymentMode,
   StaffPermissions,
@@ -27,11 +29,18 @@ import {
   ActorContext,
   assignOrRenewMembership,
   bulkImportGymMembers,
+  cancelMemberMembership,
   createGymMember,
   deleteGymMemberPermanently,
   updateGymMember,
 } from '../../services/gymos-service';
 import { deriveMemberMembershipStatus } from '../../lib/domain/dates';
+import {
+  calculateNetPlanAmount,
+  canStaffConfirmPayment,
+  canStaffViewPayments,
+  deriveMemberPaymentDisplayStatus,
+} from '../../lib/domain/payments';
 import {
   CsvImportRowResult,
   exportMembersToCsv,
@@ -41,6 +50,8 @@ import {
 import { formatCurrency, formatDisplayDate, toIsoDate } from '../../lib/utils';
 import { StatusLabel } from '../common/StatusBadge';
 import { Modal } from '../common/Modal';
+import { ConfirmModal } from '../common/ConfirmModal';
+import { Pagination } from '../common/Pagination';
 
 interface MembersViewProps {
   actor: ActorContext;
@@ -68,17 +79,26 @@ export const MembersView: React.FC<MembersViewProps> = ({
   const activePlans = plans.filter((p) => p.status === 'ACTIVE');
 
   const [search, setSearch] = useState('');
-  const [statusFilter, setStatusFilter] = useState<'ALL' | 'ACTIVE' | 'EXPIRED' | 'EXPIRING_SOON' | 'ARCHIVED'>('ALL');
+  const [statusFilter, setStatusFilter] = useState<
+    'ALL' | 'ACTIVE' | 'EXPIRED' | 'EXPIRING_SOON' | 'CANCELLED' | 'ARCHIVED'
+  >('ALL');
   const [sortBy, setSortBy] = useState<'NAME' | 'EXPIRY' | 'JOINED'>('JOINED');
+  const [page, setPage] = useState(1);
+  const PAGE_SIZE = 20;
 
   const [showAddModal, setShowAddModal] = useState(false);
   const [editingMember, setEditingMember] = useState<Member | null>(null);
   const [profileMember, setProfileMember] = useState<Member | null>(null);
   const [renewMember, setRenewMember] = useState<Member | null>(null);
+  const [cancellingMember, setCancellingMember] = useState<Member | null>(null);
+  const [deletingMember, setDeletingMember] = useState<Member | null>(null);
   const [showImportModal, setShowImportModal] = useState(false);
 
   const [csvText, setCsvText] = useState('');
   const [importPreview, setImportPreview] = useState<CsvImportRowResult[]>([]);
+
+  const canConfirmPayments = canStaffConfirmPayment(actor.role, permissions);
+  const canViewPayments = canStaffViewPayments(actor.role, permissions);
 
   const [addForm, setAddForm] = useState({
     fullName: '',
@@ -92,20 +112,26 @@ export const MembersView: React.FC<MembersViewProps> = ({
     notes: '',
     reminderOptOut: false,
     planId: '',
+    discountAmount: '',
+    discountReason: '',
+    dueDate: '',
     paymentAmount: '',
     paymentMode: PaymentMode.CASH,
     transactionReference: '',
-    confirmPaymentNow: true,
+    confirmPaymentNow: canConfirmPayments,
   });
 
   const [renewForm, setRenewForm] = useState({
     planId: activePlans[0]?.id || '',
     actionType: MembershipActionType.RENEWAL,
     customExpiryDate: today,
+    discountAmount: '',
+    discountReason: '',
+    dueDate: '',
     amountPaidNow: '',
     paymentMode: PaymentMode.CASH,
     transactionReference: '',
-    confirmPaymentNow: true,
+    confirmPaymentNow: canConfirmPayments,
     notes: '',
   });
 
@@ -120,7 +146,11 @@ export const MembersView: React.FC<MembersViewProps> = ({
         if (!m.isArchived) return false;
       } else {
         if (m.isArchived) return false;
-        const derived = deriveMemberMembershipStatus(m.membershipExpiryDate, today);
+        const derived =
+          m.membershipStatus === MembershipStatus.CANCELLED
+            ? MembershipStatus.CANCELLED
+            : deriveMemberMembershipStatus(m.membershipExpiryDate, today);
+        if (statusFilter === 'CANCELLED' && derived !== MembershipStatus.CANCELLED) return false;
         if (statusFilter === 'ACTIVE' && derived !== MembershipStatus.ACTIVE && derived !== MembershipStatus.EXPIRING_SOON) return false;
         if (statusFilter === 'EXPIRING_SOON' && derived !== MembershipStatus.EXPIRING_SOON) return false;
         if (statusFilter === 'EXPIRED' && derived !== MembershipStatus.EXPIRED) return false;
@@ -142,6 +172,27 @@ export const MembersView: React.FC<MembersViewProps> = ({
     });
   }, [members, search, statusFilter, sortBy, today]);
 
+  const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
+  const currentPage = Math.min(page, totalPages);
+  const paginated = useMemo(
+    () => filtered.slice((currentPage - 1) * PAGE_SIZE, currentPage * PAGE_SIZE),
+    [filtered, currentPage]
+  );
+
+  const selectedAddPlan = activePlans.find((p) => p.id === addForm.planId);
+  const addPlanAmounts = calculateNetPlanAmount(
+    selectedAddPlan?.price ?? 0,
+    addForm.discountAmount ? Number(addForm.discountAmount) : 0
+  );
+
+  const selectedRenewPlan = plans.find((p) => p.id === renewForm.planId) || plans[0];
+  const renewPlanAmounts = calculateNetPlanAmount(
+    renewForm.actionType === MembershipActionType.MANUAL_EXTENSION
+      ? 0
+      : selectedRenewPlan?.price ?? 0,
+    renewForm.discountAmount ? Number(renewForm.discountAmount) : 0
+  );
+
   const handleRegister = async (e: React.FormEvent) => {
     e.preventDefault();
     setBusy(true);
@@ -160,10 +211,13 @@ export const MembersView: React.FC<MembersViewProps> = ({
         notes: addForm.notes,
         reminderOptOut: addForm.reminderOptOut,
         initialPlan: plan,
+        discountAmount: addForm.discountAmount ? Number(addForm.discountAmount) : 0,
+        discountReason: addForm.discountReason,
+        dueDate: addForm.dueDate || undefined,
         paymentAmount: addForm.paymentAmount ? Number(addForm.paymentAmount) : 0,
         paymentMode: addForm.paymentMode,
         transactionReference: addForm.transactionReference,
-        confirmPaymentNow: addForm.confirmPaymentNow,
+        confirmPaymentNow: canConfirmPayments && addForm.confirmPaymentNow,
       });
       setShowAddModal(false);
       setAddForm({
@@ -178,10 +232,13 @@ export const MembersView: React.FC<MembersViewProps> = ({
         notes: '',
         reminderOptOut: false,
         planId: '',
+        discountAmount: '',
+        discountReason: '',
+        dueDate: '',
         paymentAmount: '',
         paymentMode: PaymentMode.CASH,
         transactionReference: '',
-        confirmPaymentNow: true,
+        confirmPaymentNow: canConfirmPayments,
       });
       setFeedback('Member registered successfully.');
     } catch (err) {
@@ -229,10 +286,13 @@ export const MembersView: React.FC<MembersViewProps> = ({
     try {
       await assignOrRenewMembership(actor, gym, renewMember, plan, renewForm.actionType, settings, {
         customExpiryDate: renewForm.customExpiryDate,
+        discountAmount: renewForm.discountAmount ? Number(renewForm.discountAmount) : 0,
+        discountReason: renewForm.discountReason,
+        dueDate: renewForm.dueDate || undefined,
         amountPaidNow: renewForm.amountPaidNow ? Number(renewForm.amountPaidNow) : 0,
         paymentMode: renewForm.paymentMode,
         transactionReference: renewForm.transactionReference,
-        confirmPaymentNow: renewForm.confirmPaymentNow,
+        confirmPaymentNow: canConfirmPayments && renewForm.confirmPaymentNow,
         notes: renewForm.notes,
       });
       setRenewMember(null);
@@ -241,6 +301,34 @@ export const MembersView: React.FC<MembersViewProps> = ({
       setErrorMsg(err instanceof Error ? err.message : 'Failed to process membership update.');
     } finally {
       setBusy(false);
+    }
+  };
+
+  const handleCancelMembershipConfirm = async (reason?: string) => {
+    if (!cancellingMember || !reason) return;
+    setErrorMsg(null);
+    try {
+      const activeMs = memberships.find(
+        (ms) =>
+          ms.memberId === cancellingMember.id && ms.status === MembershipRecordStatus.ACTIVE
+      );
+      await cancelMemberMembership(actor, gym.id, cancellingMember, activeMs, reason);
+      setFeedback(`Cancelled membership for ${cancellingMember.fullName}.`);
+      setCancellingMember(null);
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : 'Failed to cancel membership.');
+    }
+  };
+
+  const handleDeletePermanentConfirm = async () => {
+    if (!deletingMember) return;
+    setErrorMsg(null);
+    try {
+      await deleteGymMemberPermanently(actor, gym.id, deletingMember);
+      setFeedback(`Permanently deleted ${deletingMember.fullName}.`);
+      setDeletingMember(null);
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : 'Failed to delete member.');
     }
   };
 
@@ -277,25 +365,35 @@ export const MembersView: React.FC<MembersViewProps> = ({
             <input
               type="text"
               value={search}
-              onChange={(e) => setSearch(e.target.value)}
+              onChange={(e) => {
+                setSearch(e.target.value);
+                setPage(1);
+              }}
               placeholder="Search name, phone, member ID..."
               className="w-full pl-9 pr-3 py-2 text-xs bg-white border border-slate-200 rounded-md"
             />
           </div>
           <select
             value={statusFilter}
-            onChange={(e) => setStatusFilter(e.target.value as typeof statusFilter)}
+            onChange={(e) => {
+              setStatusFilter(e.target.value as typeof statusFilter);
+              setPage(1);
+            }}
             className="px-3 py-2 text-xs bg-white border border-slate-200 rounded-md"
           >
             <option value="ALL">All Active Records</option>
             <option value="ACTIVE">Active Memberships</option>
             <option value="EXPIRING_SOON">Expiring Within 7 Days</option>
             <option value="EXPIRED">Expired</option>
+            <option value="CANCELLED">Cancelled</option>
             <option value="ARCHIVED">Archived</option>
           </select>
           <select
             value={sortBy}
-            onChange={(e) => setSortBy(e.target.value as typeof sortBy)}
+            onChange={(e) => {
+              setSortBy(e.target.value as typeof sortBy);
+              setPage(1);
+            }}
             className="px-3 py-2 text-xs bg-white border border-slate-200 rounded-md"
           >
             <option value="JOINED">Sort: Recently Joined</option>
@@ -372,14 +470,21 @@ export const MembersView: React.FC<MembersViewProps> = ({
                   <th className="px-4 py-3 font-medium">Contact</th>
                   <th className="px-4 py-3 font-medium">Current Plan</th>
                   <th className="px-4 py-3 font-medium">Expiry</th>
-                  <th className="px-4 py-3 font-medium">Status</th>
-                  <th className="px-4 py-3 font-medium text-right">Balance Due</th>
+                  <th className="px-4 py-3 font-medium">Membership</th>
+                  {canViewPayments && <th className="px-4 py-3 font-medium">Payment Status</th>}
+                  {canViewPayments && <th className="px-4 py-3 font-medium text-right">Balance Due</th>}
                   <th className="px-4 py-3 font-medium text-right">Actions</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-200">
-                {filtered.map((m) => {
-                  const derived = deriveMemberMembershipStatus(m.membershipExpiryDate, today);
+                {paginated.map((m) => {
+                  const derived =
+                    m.membershipStatus === MembershipStatus.CANCELLED
+                      ? MembershipStatus.CANCELLED
+                      : deriveMemberMembershipStatus(m.membershipExpiryDate, today);
+                  const paymentDisplayStatus = canViewPayments
+                    ? deriveMemberPaymentDisplayStatus(m, payments, memberships, today)
+                    : null;
                   return (
                     <tr key={m.id} className="hover:bg-slate-50">
                       <td className="px-4 py-3 font-mono tabular-nums text-slate-700 whitespace-nowrap">
@@ -397,9 +502,16 @@ export const MembersView: React.FC<MembersViewProps> = ({
                       <td className="px-4 py-3">
                         <StatusLabel status={derived} />
                       </td>
-                      <td className="px-4 py-3 font-mono tabular-nums text-right text-slate-900">
-                        {formatCurrency(m.outstandingBalance, currency)}
-                      </td>
+                      {canViewPayments && paymentDisplayStatus && (
+                        <td className="px-4 py-3">
+                          <StatusLabel status={paymentDisplayStatus} />
+                        </td>
+                      )}
+                      {canViewPayments && (
+                        <td className="px-4 py-3 font-mono tabular-nums text-right text-slate-900">
+                          {formatCurrency(m.outstandingBalance, currency)}
+                        </td>
+                      )}
                       <td className="px-4 py-3 text-right whitespace-nowrap">
                         <div className="inline-flex items-center gap-1">
                           <button
@@ -420,10 +532,13 @@ export const MembersView: React.FC<MembersViewProps> = ({
                                 planId: defaultPlan?.id || '',
                                 actionType: MembershipActionType.RENEWAL,
                                 customExpiryDate: m.membershipExpiryDate || today,
+                                discountAmount: '',
+                                discountReason: '',
+                                dueDate: '',
                                 amountPaidNow: defaultPlan ? String(defaultPlan.price) : '',
                                 paymentMode: PaymentMode.CASH,
                                 transactionReference: '',
-                                confirmPaymentNow: true,
+                                confirmPaymentNow: canConfirmPayments,
                                 notes: '',
                               });
                             }}
@@ -432,6 +547,18 @@ export const MembersView: React.FC<MembersViewProps> = ({
                           >
                             <RefreshCw className="w-3.5 h-3.5" />
                           </button>
+                          {!m.isArchived &&
+                            m.currentPlanId &&
+                            m.membershipStatus !== MembershipStatus.CANCELLED && (
+                              <button
+                                type="button"
+                                onClick={() => setCancellingMember(m)}
+                                className="p-1.5 text-slate-500 hover:text-red-700 hover:bg-red-50 rounded cursor-pointer"
+                                title="Cancel active membership"
+                              >
+                                <Ban className="w-3.5 h-3.5" />
+                              </button>
+                            )}
                           <button
                             type="button"
                             onClick={() => setEditingMember({ ...m })}
@@ -442,11 +569,18 @@ export const MembersView: React.FC<MembersViewProps> = ({
                           </button>
                           <button
                             type="button"
-                            onClick={() =>
-                              updateGymMember(actor, gym.id, m.id, {
-                                isArchived: !m.isArchived,
-                              })
-                            }
+                            onClick={async () => {
+                              setErrorMsg(null);
+                              try {
+                                await updateGymMember(actor, gym.id, m.id, {
+                                  isArchived: !m.isArchived,
+                                });
+                              } catch (err) {
+                                setErrorMsg(
+                                  err instanceof Error ? err.message : 'Failed to update archive status.'
+                                );
+                              }
+                            }}
                             className="p-1.5 text-slate-500 hover:text-amber-700 hover:bg-amber-50 rounded cursor-pointer"
                             title={m.isArchived ? 'Restore member' : 'Archive member'}
                           >
@@ -455,7 +589,7 @@ export const MembersView: React.FC<MembersViewProps> = ({
                           {canDelete && m.isArchived && (
                             <button
                               type="button"
-                              onClick={() => deleteGymMemberPermanently(actor, gym.id, m)}
+                              onClick={() => setDeletingMember(m)}
                               className="p-1.5 text-red-600 hover:bg-red-50 rounded cursor-pointer"
                               title="Delete permanently"
                             >
@@ -471,6 +605,12 @@ export const MembersView: React.FC<MembersViewProps> = ({
             </table>
           </div>
         )}
+        <Pagination
+          page={currentPage}
+          pageSize={PAGE_SIZE}
+          totalItems={filtered.length}
+          onPageChange={setPage}
+        />
       </div>
 
       {/* Add Member Modal */}
@@ -573,10 +713,12 @@ export const MembersView: React.FC<MembersViewProps> = ({
                   value={addForm.planId}
                   onChange={(e) => {
                     const p = activePlans.find((x) => x.id === e.target.value);
+                    const disc = addForm.discountAmount ? Number(addForm.discountAmount) : 0;
+                    const net = p ? calculateNetPlanAmount(p.price, disc).netPrice : 0;
                     setAddForm({
                       ...addForm,
                       planId: e.target.value,
-                      paymentAmount: p ? String(p.price) : '',
+                      paymentAmount: p ? String(net) : '',
                     });
                   }}
                   className="px-3 py-2 text-xs border border-slate-200 rounded-md"
@@ -592,6 +734,7 @@ export const MembersView: React.FC<MembersViewProps> = ({
                   <input
                     type="number"
                     min="0"
+                    step="0.01"
                     placeholder="Amount paid now"
                     value={addForm.paymentAmount}
                     onChange={(e) => setAddForm({ ...addForm, paymentAmount: e.target.value })}
@@ -599,6 +742,59 @@ export const MembersView: React.FC<MembersViewProps> = ({
                   />
                 )}
               </div>
+              {addForm.planId && (
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 mt-3">
+                  <div>
+                    <label className="block text-[11px] text-slate-500 mb-1">Discount</label>
+                    <input
+                      type="number"
+                      min="0"
+                      step="0.01"
+                      placeholder="0"
+                      value={addForm.discountAmount}
+                      onChange={(e) => {
+                        const val = e.target.value;
+                        const net = calculateNetPlanAmount(
+                          selectedAddPlan?.price ?? 0,
+                          val ? Number(val) : 0
+                        ).netPrice;
+                        setAddForm({
+                          ...addForm,
+                          discountAmount: val,
+                          paymentAmount: String(net),
+                        });
+                      }}
+                      className="w-full px-3 py-1.5 text-xs border border-slate-200 rounded-md font-mono"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-[11px] text-slate-500 mb-1">Discount Reason</label>
+                    <input
+                      type="text"
+                      placeholder="Promo / referral"
+                      value={addForm.discountReason}
+                      onChange={(e) => setAddForm({ ...addForm, discountReason: e.target.value })}
+                      className="w-full px-3 py-1.5 text-xs border border-slate-200 rounded-md"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-[11px] text-slate-500 mb-1">Balance Due Date</label>
+                    <input
+                      type="date"
+                      value={addForm.dueDate}
+                      onChange={(e) => setAddForm({ ...addForm, dueDate: e.target.value })}
+                      className="w-full px-3 py-1.5 text-xs border border-slate-200 rounded-md font-mono"
+                    />
+                  </div>
+                  <p className="sm:col-span-3 text-[11px] text-slate-600 font-mono">
+                    Plan: {formatCurrency(addPlanAmounts.grossPrice, currency)} · Discount:{' '}
+                    {formatCurrency(addPlanAmounts.discount, currency)} · Net Payable:{' '}
+                    <span className="font-semibold text-slate-900">
+                      {formatCurrency(addPlanAmounts.netPrice, currency)}
+                    </span>
+                  </p>
+                </div>
+              )}
               {addForm.planId && Number(addForm.paymentAmount) > 0 && (
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mt-3">
                   <select
@@ -622,16 +818,18 @@ export const MembersView: React.FC<MembersViewProps> = ({
                       className="px-3 py-2 text-xs border border-slate-200 rounded-md font-mono"
                     />
                   )}
-                  <label className="sm:col-span-2 flex items-center gap-2 text-xs text-slate-700 cursor-pointer">
-                    <input
-                      type="checkbox"
-                      checked={addForm.confirmPaymentNow}
-                      onChange={(e) =>
-                        setAddForm({ ...addForm, confirmPaymentNow: e.target.checked })
-                      }
-                    />
-                    Confirm receipt immediately (for UPI, verify in bank/UPI app first)
-                  </label>
+                  {canConfirmPayments && (
+                    <label className="sm:col-span-2 flex items-center gap-2 text-xs text-slate-700 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={addForm.confirmPaymentNow}
+                        onChange={(e) =>
+                          setAddForm({ ...addForm, confirmPaymentNow: e.target.checked })
+                        }
+                      />
+                      Confirm receipt immediately (for UPI, verify in bank/UPI app first)
+                    </label>
+                  )}
                 </div>
               )}
             </div>
@@ -802,10 +1000,12 @@ export const MembersView: React.FC<MembersViewProps> = ({
                 value={renewForm.planId}
                 onChange={(e) => {
                   const p = plans.find((x) => x.id === e.target.value);
+                  const disc = renewForm.discountAmount ? Number(renewForm.discountAmount) : 0;
+                  const net = p ? calculateNetPlanAmount(p.price, disc).netPrice : 0;
                   setRenewForm({
                     ...renewForm,
                     planId: e.target.value,
-                    amountPaidNow: p ? String(p.price) : '',
+                    amountPaidNow: p ? String(net) : '',
                   });
                 }}
                 className="w-full px-3 py-2 text-xs border border-slate-200 rounded-md"
@@ -833,11 +1033,61 @@ export const MembersView: React.FC<MembersViewProps> = ({
               </div>
             )}
 
+            {renewForm.actionType !== MembershipActionType.MANUAL_EXTENSION && (
+              <>
+                <div>
+                  <label className="block text-xs font-medium text-slate-700 mb-1">Discount</label>
+                  <input
+                    type="number"
+                    min="0"
+                    step="0.01"
+                    placeholder="0"
+                    value={renewForm.discountAmount}
+                    onChange={(e) => {
+                      const val = e.target.value;
+                      const net = calculateNetPlanAmount(
+                        selectedRenewPlan?.price ?? 0,
+                        val ? Number(val) : 0
+                      ).netPrice;
+                      setRenewForm({
+                        ...renewForm,
+                        discountAmount: val,
+                        amountPaidNow: String(net),
+                      });
+                    }}
+                    className="w-full px-3 py-2 text-xs border border-slate-200 rounded-md font-mono"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-slate-700 mb-1">
+                    Discount Reason
+                  </label>
+                  <input
+                    type="text"
+                    placeholder="Loyalty / offer"
+                    value={renewForm.discountReason}
+                    onChange={(e) =>
+                      setRenewForm({ ...renewForm, discountReason: e.target.value })
+                    }
+                    className="w-full px-3 py-2 text-xs border border-slate-200 rounded-md"
+                  />
+                </div>
+                <div className="col-span-2 text-[11px] font-mono text-slate-600">
+                  Plan: {formatCurrency(renewPlanAmounts.grossPrice, currency)} · Discount:{' '}
+                  {formatCurrency(renewPlanAmounts.discount, currency)} · Net Payable:{' '}
+                  <span className="font-semibold text-slate-900">
+                    {formatCurrency(renewPlanAmounts.netPrice, currency)}
+                  </span>
+                </div>
+              </>
+            )}
+
             <div>
               <label className="block text-xs font-medium text-slate-700 mb-1">Amount Paid Now</label>
               <input
                 type="number"
                 min="0"
+                step="0.01"
                 value={renewForm.amountPaidNow}
                 onChange={(e) => setRenewForm({ ...renewForm, amountPaidNow: e.target.value })}
                 className="w-full px-3 py-2 text-xs border border-slate-200 rounded-md font-mono"
@@ -856,6 +1106,26 @@ export const MembersView: React.FC<MembersViewProps> = ({
                 <option value={PaymentMode.UPI}>UPI</option>
               </select>
             </div>
+            <div>
+              <label className="block text-xs font-medium text-slate-700 mb-1">
+                Balance Due Date (if partial)
+              </label>
+              <input
+                type="date"
+                value={renewForm.dueDate}
+                onChange={(e) => setRenewForm({ ...renewForm, dueDate: e.target.value })}
+                className="w-full px-3 py-2 text-xs border border-slate-200 rounded-md font-mono"
+              />
+            </div>
+            <div>
+              <label className="block text-xs font-medium text-slate-700 mb-1">Notes</label>
+              <input
+                type="text"
+                value={renewForm.notes}
+                onChange={(e) => setRenewForm({ ...renewForm, notes: e.target.value })}
+                className="w-full px-3 py-2 text-xs border border-slate-200 rounded-md"
+              />
+            </div>
             {renewForm.paymentMode === PaymentMode.UPI && Number(renewForm.amountPaidNow) > 0 && (
               <div className="col-span-2">
                 <label className="block text-xs font-medium text-slate-700 mb-1">UPI Reference</label>
@@ -869,16 +1139,18 @@ export const MembersView: React.FC<MembersViewProps> = ({
                 />
               </div>
             )}
-            <label className="col-span-2 flex items-center gap-2 text-xs text-slate-700 cursor-pointer">
-              <input
-                type="checkbox"
-                checked={renewForm.confirmPaymentNow}
-                onChange={(e) =>
-                  setRenewForm({ ...renewForm, confirmPaymentNow: e.target.checked })
-                }
-              />
-              Confirm payment receipt now & generate receipt
-            </label>
+            {canConfirmPayments && (
+              <label className="col-span-2 flex items-center gap-2 text-xs text-slate-700 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={renewForm.confirmPaymentNow}
+                  onChange={(e) =>
+                    setRenewForm({ ...renewForm, confirmPaymentNow: e.target.checked })
+                  }
+                />
+                Confirm payment receipt now & generate receipt
+              </label>
+            )}
           </div>
           <div className="flex justify-end gap-3 pt-2">
             <button
@@ -1098,6 +1370,29 @@ export const MembersView: React.FC<MembersViewProps> = ({
           </div>
         </div>
       </Modal>
+
+      <ConfirmModal
+        open={Boolean(cancellingMember)}
+        title={`Cancel Membership · ${cancellingMember?.fullName || ''}`}
+        description="Cancels the member's active plan and clears the current expiry date while preserving all payment and membership history."
+        confirmLabel="Cancel Membership"
+        variant="danger"
+        requireReason
+        reasonLabel="Cancellation Reason"
+        reasonPlaceholder="e.g. Member relocated / requested cancellation"
+        onConfirm={handleCancelMembershipConfirm}
+        onCancel={() => setCancellingMember(null)}
+      />
+
+      <ConfirmModal
+        open={Boolean(deletingMember)}
+        title={`Permanently Delete Member · ${deletingMember?.fullName || ''}`}
+        description="This permanently removes the archived member profile document. Historical receipts and payments remain in the ledger."
+        confirmLabel="Delete Permanently"
+        variant="danger"
+        onConfirm={handleDeletePermanentConfirm}
+        onCancel={() => setDeletingMember(null)}
+      />
     </div>
   );
 };

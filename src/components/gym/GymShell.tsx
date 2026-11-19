@@ -19,11 +19,13 @@ import {
   Menu,
   X,
   AlertTriangle,
+  CalendarCheck2,
 } from 'lucide-react';
 import { db } from '../../lib/firebase';
 import { handleFirestoreError, OperationType } from '../../lib/firestore-error';
 import { useAuth } from '../../contexts/AuthContext';
 import {
+  AttendanceRecord,
   AuditLog,
   GymNotification,
   GymSettings,
@@ -41,11 +43,13 @@ import {
 } from '../../types/gymos';
 import { ActorContext } from '../../services/gymos-service';
 import { diffDays } from '../../lib/domain/dates';
+import { canStaffViewPayments } from '../../lib/domain/payments';
 import { timestampToIso, toIsoDate } from '../../lib/utils';
 import { GymDashboard } from './GymDashboard';
 import { MembersView } from './MembersView';
 import { MembershipPlansView } from './MembershipPlansView';
 import { PaymentsView } from './PaymentsView';
+import { AttendanceView } from './AttendanceView';
 import { RemindersView } from './RemindersView';
 import { ReportsView } from './ReportsView';
 import { StaffView } from './StaffView';
@@ -54,6 +58,7 @@ import { GymSettingsView } from './GymSettingsView';
 type GymTab =
   | 'dashboard'
   | 'members'
+  | 'attendance'
   | 'plans'
   | 'payments'
   | 'reminders'
@@ -68,6 +73,7 @@ export const GymShell: React.FC = () => {
 
   const [settings, setSettings] = useState<GymSettings | null>(null);
   const [members, setMembers] = useState<Member[]>([]);
+  const [attendance, setAttendance] = useState<AttendanceRecord[]>([]);
   const [plans, setPlans] = useState<MembershipPlan[]>([]);
   const [memberships, setMemberships] = useState<Membership[]>([]);
   const [payments, setPayments] = useState<MemberPayment[]>([]);
@@ -77,6 +83,19 @@ export const GymShell: React.FC = () => {
   const [staffList, setStaffList] = useState<GymStaff[]>([]);
   const [invitations, setInvitations] = useState<StaffInvitation[]>([]);
   const [auditLogs, setAuditLogs] = useState<AuditLog[]>([]);
+
+  const isOwner =
+    profile?.role === UserRole.GYM_OWNER || profile?.role === UserRole.SUPER_ADMIN;
+  const isManager = profile?.role === UserRole.GYM_MANAGER;
+  const canViewPayments = profile
+    ? canStaffViewPayments(profile.role, effectivePermissions)
+    : false;
+  const canManageReminders =
+    isOwner || isManager || Boolean(effectivePermissions.canManageReminders);
+  const canManageAttendance =
+    isOwner || isManager || Boolean(effectivePermissions.canManageAttendance);
+  const canViewReports =
+    isOwner || isManager || Boolean(effectivePermissions.canViewReports);
 
   useEffect(() => {
     if (!gym?.id || !profile) return;
@@ -103,6 +122,14 @@ export const GymShell: React.FC = () => {
         (err) => handleFirestoreError(err, OperationType.LIST, `gyms/${gymId}/members`)
       ),
       onSnapshot(
+        query(collection(db, 'gyms', gymId, 'attendance'), where('gymId', '==', gymId)),
+        (snap) =>
+          setAttendance(
+            sortByCreatedDesc(snap.docs.map((d) => d.data() as AttendanceRecord))
+          ),
+        (err) => handleFirestoreError(err, OperationType.LIST, `gyms/${gymId}/attendance`)
+      ),
+      onSnapshot(
         query(collection(db, 'gyms', gymId, 'membership_plans'), where('gymId', '==', gymId)),
         (snap) =>
           setPlans(
@@ -119,26 +146,6 @@ export const GymShell: React.FC = () => {
         (err) => handleFirestoreError(err, OperationType.LIST, `gyms/${gymId}/memberships`)
       ),
       onSnapshot(
-        query(collection(db, 'gyms', gymId, 'member_payments'), where('gymId', '==', gymId)),
-        (snap) =>
-          setPayments(sortByCreatedDesc(snap.docs.map((d) => d.data() as MemberPayment))),
-        (err) => handleFirestoreError(err, OperationType.LIST, `gyms/${gymId}/member_payments`)
-      ),
-      onSnapshot(
-        query(collection(db, 'gyms', gymId, 'payment_receipts'), where('gymId', '==', gymId)),
-        (snap) =>
-          setReceipts(
-            snap.docs
-              .map((d) => d.data() as PaymentReceipt)
-              .sort((a, b) =>
-                (timestampToIso(b.issuedAt) || '9999').localeCompare(
-                  timestampToIso(a.issuedAt) || '9999'
-                )
-              )
-          ),
-        (err) => handleFirestoreError(err, OperationType.LIST, `gyms/${gymId}/payment_receipts`)
-      ),
-      onSnapshot(
         query(collection(db, 'gyms', gymId, 'notifications'), where('gymId', '==', gymId)),
         (snap) =>
           setNotifications(
@@ -147,21 +154,56 @@ export const GymShell: React.FC = () => {
         (err) => handleFirestoreError(err, OperationType.LIST, `gyms/${gymId}/notifications`)
       ),
       onSnapshot(
-        query(collection(db, 'gyms', gymId, 'notification_logs'), where('gymId', '==', gymId)),
-        (snap) =>
-          setNotificationLogs(
-            sortByCreatedDesc(snap.docs.map((d) => d.data() as NotificationLog))
-          ),
-        (err) => handleFirestoreError(err, OperationType.LIST, `gyms/${gymId}/notification_logs`)
-      ),
-      onSnapshot(
         query(collection(db, 'gyms', gymId, 'staff'), where('gymId', '==', gymId)),
         (snap) => setStaffList(sortByCreatedDesc(snap.docs.map((d) => d.data() as GymStaff))),
         (err) => handleFirestoreError(err, OperationType.LIST, `gyms/${gymId}/staff`)
       ),
     ];
 
-    if (profile.role === UserRole.GYM_OWNER || profile.role === UserRole.SUPER_ADMIN) {
+    if (canViewPayments) {
+      unsubs.push(
+        onSnapshot(
+          query(collection(db, 'gyms', gymId, 'member_payments'), where('gymId', '==', gymId)),
+          (snap) =>
+            setPayments(sortByCreatedDesc(snap.docs.map((d) => d.data() as MemberPayment))),
+          (err) => handleFirestoreError(err, OperationType.LIST, `gyms/${gymId}/member_payments`)
+        ),
+        onSnapshot(
+          query(collection(db, 'gyms', gymId, 'payment_receipts'), where('gymId', '==', gymId)),
+          (snap) =>
+            setReceipts(
+              snap.docs
+                .map((d) => d.data() as PaymentReceipt)
+                .sort((a, b) =>
+                  (timestampToIso(b.issuedAt) || '9999').localeCompare(
+                    timestampToIso(a.issuedAt) || '9999'
+                  )
+                )
+            ),
+          (err) => handleFirestoreError(err, OperationType.LIST, `gyms/${gymId}/payment_receipts`)
+        )
+      );
+    } else {
+      setPayments([]);
+      setReceipts([]);
+    }
+
+    if (canManageReminders) {
+      unsubs.push(
+        onSnapshot(
+          query(collection(db, 'gyms', gymId, 'notification_logs'), where('gymId', '==', gymId)),
+          (snap) =>
+            setNotificationLogs(
+              sortByCreatedDesc(snap.docs.map((d) => d.data() as NotificationLog))
+            ),
+          (err) => handleFirestoreError(err, OperationType.LIST, `gyms/${gymId}/notification_logs`)
+        )
+      );
+    } else {
+      setNotificationLogs([]);
+    }
+
+    if (isOwner) {
       const invQuery =
         profile.role === UserRole.SUPER_ADMIN
           ? query(collection(db, 'invitations'), where('gymId', '==', gymId))
@@ -186,7 +228,7 @@ export const GymShell: React.FC = () => {
     }
 
     return () => unsubs.forEach((u) => u());
-  }, [gym?.id, profile]);
+  }, [gym?.id, profile, isOwner, canViewPayments, canManageReminders]);
 
   if (!profile || !gym) return null;
 
@@ -204,6 +246,10 @@ export const GymShell: React.FC = () => {
     reminderDaysBefore: [7, 3, 1],
     sendOnExpiryDay: true,
     sendAfterExpiryDays: [3, 7],
+    paymentRemindersEnabled: true,
+    upcomingPaymentReminderDays: 3,
+    overduePaymentReminderDays: [1, 3, 7, 14],
+    ownerSubReminderDays: [7, 3, 1, 0, -3],
     emailEnabled: true,
     emailFromName: gym.name,
     inAppEnabled: true,
@@ -212,17 +258,13 @@ export const GymShell: React.FC = () => {
     updatedAt: null,
   };
 
-  const isOwner =
-    profile.role === UserRole.GYM_OWNER || profile.role === UserRole.SUPER_ADMIN;
-  const canViewReports =
-    isOwner || profile.role === UserRole.GYM_MANAGER || effectivePermissions.canViewReports;
-
   const navItems: { id: GymTab; label: string; icon: React.ReactNode; visible: boolean }[] = [
     { id: 'dashboard', label: 'Dashboard', icon: <LayoutDashboard className="w-4 h-4" />, visible: true },
     { id: 'members', label: 'Members', icon: <Users className="w-4 h-4" />, visible: true },
+    { id: 'attendance', label: 'Attendance', icon: <CalendarCheck2 className="w-4 h-4" />, visible: canManageAttendance },
     { id: 'plans', label: 'Membership Plans', icon: <Layers className="w-4 h-4" />, visible: true },
-    { id: 'payments', label: 'Cash & UPI Payments', icon: <CreditCard className="w-4 h-4" />, visible: true },
-    { id: 'reminders', label: 'Reminders & Alerts', icon: <BellRing className="w-4 h-4" />, visible: true },
+    { id: 'payments', label: 'Cash & UPI Payments', icon: <CreditCard className="w-4 h-4" />, visible: canViewPayments },
+    { id: 'reminders', label: 'Reminders & Alerts', icon: <BellRing className="w-4 h-4" />, visible: canManageReminders },
     { id: 'reports', label: 'Reports', icon: <BarChart3 className="w-4 h-4" />, visible: canViewReports },
     { id: 'staff', label: 'Staff & Access', icon: <UserCog className="w-4 h-4" />, visible: isOwner },
     { id: 'settings', label: 'Billing & Settings', icon: <Settings className="w-4 h-4" />, visible: isOwner },
@@ -375,6 +417,15 @@ export const GymShell: React.FC = () => {
               payments={payments}
             />
           )}
+          {tab === 'attendance' && canManageAttendance && (
+            <AttendanceView
+              actor={actor}
+              gym={gym}
+              permissions={effectivePermissions}
+              members={members}
+              attendance={attendance}
+            />
+          )}
           {tab === 'plans' && (
             <MembershipPlansView
               actor={actor}
@@ -384,24 +435,26 @@ export const GymShell: React.FC = () => {
               plans={plans}
             />
           )}
-          {tab === 'payments' && (
+          {tab === 'payments' && canViewPayments && (
             <PaymentsView
               actor={actor}
               gym={gym}
               settings={resolvedSettings}
               permissions={effectivePermissions}
               members={members}
+              memberships={memberships}
               payments={payments}
               receipts={receipts}
             />
           )}
-          {tab === 'reminders' && (
+          {tab === 'reminders' && canManageReminders && (
             <RemindersView
               actor={actor}
               gym={gym}
               settings={resolvedSettings}
               permissions={effectivePermissions}
               members={members}
+              memberships={memberships}
               logs={notificationLogs}
               notifications={notifications}
             />

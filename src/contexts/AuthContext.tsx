@@ -30,22 +30,41 @@ import {
   UserStatus,
 } from '../types/gymos';
 import { ensurePlatformDefaults } from '../services/gymos-service';
+import {
+  evaluateGymSubscriptionAccess,
+  type SubscriptionAccessState,
+} from '../lib/domain/subscription';
+import { toIsoDate } from '../lib/utils';
 
-const BOOTSTRAP_SUPER_ADMIN_EMAIL = 'iybmickey@gmail.com';
 const ADMIN_ACTIVE_GYM_STORAGE_KEY = 'gymos_admin_active_gym_id';
 
 const DEFAULT_PERMISSIONS: StaffPermissions = {
   canViewReports: false,
+  canViewPayments: false,
+  canRecordPayments: false,
   canManagePlans: false,
   canConfirmPayments: false,
   canDeleteMembers: false,
   canManageReminders: false,
+  canManageAttendance: false,
+};
+
+const FULL_PERMISSIONS: StaffPermissions = {
+  canViewReports: true,
+  canViewPayments: true,
+  canRecordPayments: true,
+  canManagePlans: true,
+  canConfirmPayments: true,
+  canDeleteMembers: true,
+  canManageReminders: true,
+  canManageAttendance: true,
 };
 
 interface AuthContextValue {
   firebaseUser: User | null;
   profile: UserProfile | null;
   gym: Gym | null;
+  subscriptionAccess: SubscriptionAccessState | null;
   availableGyms: Gym[];
   superAdminGymId: string | null;
   staffRecord: GymStaff | null;
@@ -81,41 +100,54 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const [loading, setLoading] = useState(true);
   const [authError, setAuthError] = useState<string | null>(null);
 
-  const loadUserWorkspace = async (user: User) => {
+  const loadInvitationsForUser = async (user: User) => {
+    if (!user.email) {
+      setPendingInvitations([]);
+      return;
+    }
+    try {
+      const invQuery = query(
+        collection(db, 'invitations'),
+        where('email', '==', user.email.toLowerCase())
+      );
+      const invSnap = await getDocs(invQuery);
+      setPendingInvitations(
+        invSnap.docs
+          .map((d) => d.data() as StaffInvitation)
+          .filter((inv) => inv.status === 'PENDING')
+      );
+    } catch {
+      setPendingInvitations([]);
+    }
+  };
+
+  const syncUserAccount = async (user: User) => {
     try {
       setAuthError(null);
       const userRef = doc(db, 'users', user.uid);
       let userSnap = await getDoc(userRef);
 
-      // Bootstrap Super Admin automatically on verified owner email login
-      if (
-        !userSnap.exists() &&
-        user.email?.toLowerCase() === BOOTSTRAP_SUPER_ADMIN_EMAIL &&
-        user.emailVerified
-      ) {
-        const adminRef = doc(db, 'platform_admins', user.uid);
-        await setDoc(adminRef, {
-          uid: user.uid,
-          email: user.email.toLowerCase(),
-          displayName: user.displayName || 'Platform Owner',
-          createdAt: serverTimestamp(),
-        });
-        await setDoc(userRef, {
-          uid: user.uid,
-          email: user.email.toLowerCase(),
-          displayName: user.displayName || 'Platform Owner',
-          role: UserRole.SUPER_ADMIN,
-          status: UserStatus.ACTIVE,
-          createdAt: serverTimestamp(),
-          updatedAt: serverTimestamp(),
-        });
-        await ensurePlatformDefaults({
-          uid: user.uid,
-          email: user.email.toLowerCase(),
-          displayName: user.displayName || 'Platform Owner',
-          role: UserRole.SUPER_ADMIN,
-        });
-        userSnap = await getDoc(userRef);
+      // Check authorized platform_admins registry (created via CLI, bootstrap endpoint, or existing Super Admin)
+      if (!userSnap.exists() && user.email && user.emailVerified) {
+        try {
+          const adminSnap = await getDoc(doc(db, 'platform_admins', user.uid));
+          if (adminSnap.exists()) {
+            const adminEmail = user.email.toLowerCase();
+            const adminName = user.displayName || adminEmail.split('@')[0] || 'Platform Admin';
+            await setDoc(userRef, {
+              uid: user.uid,
+              email: adminEmail,
+              displayName: adminName,
+              role: UserRole.SUPER_ADMIN,
+              status: UserStatus.ACTIVE,
+              createdAt: serverTimestamp(),
+              updatedAt: serverTimestamp(),
+            });
+            userSnap = await getDoc(userRef);
+          }
+        } catch {
+          // Not a registered platform admin; proceed with standard tenant flow
+        }
       }
 
       if (userSnap.exists()) {
@@ -123,7 +155,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         setProfile(userData);
         setPendingInvitations([]);
 
-        if (userData.role === UserRole.SUPER_ADMIN) {
+        if (userData.role === UserRole.SUPER_ADMIN && userData.status === UserStatus.ACTIVE) {
           await ensurePlatformDefaults({
             uid: userData.uid,
             email: userData.email,
@@ -133,19 +165,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         }
       } else {
         setProfile(null);
-        // Check if this email has pending staff invitations
-        if (user.email) {
-          const invQuery = query(
-            collection(db, 'invitations'),
-            where('email', '==', user.email.toLowerCase())
-          );
-          const invSnap = await getDocs(invQuery);
-          setPendingInvitations(
-            invSnap.docs
-              .map((d) => d.data() as StaffInvitation)
-              .filter((inv) => inv.status === 'PENDING')
-          );
-        }
+        await loadInvitationsForUser(user);
       }
     } catch (error) {
       setAuthError(
@@ -167,11 +187,27 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         return;
       }
       setLoading(true);
-      await loadUserWorkspace(user);
+      await syncUserAccount(user);
       setLoading(false);
     });
     return () => unsub();
   }, []);
+
+  // Real-time listener on users/{uid} so role/status deactivation takes effect immediately
+  useEffect(() => {
+    if (!firebaseUser) return;
+    const unsub = onSnapshot(
+      doc(db, 'users', firebaseUser.uid),
+      (snap) => {
+        if (snap.exists()) {
+          setProfile(snap.data() as UserProfile);
+          setPendingInvitations([]);
+        }
+      },
+      () => {}
+    );
+    return () => unsub();
+  }, [firebaseUser]);
 
   // Subscribe to platform_settings/default when signed in
   useEffect(() => {
@@ -186,16 +222,14 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
           setPlatformSettings(snap.data() as PlatformSettings);
         }
       },
-      (error) => {
-        console.warn('Platform settings listener:', error.message);
-      }
+      () => {}
     );
     return () => unsub();
   }, [firebaseUser]);
 
   // Subscribe to all gyms for SUPER_ADMIN workspace switching
   useEffect(() => {
-    if (!firebaseUser || profile?.role !== UserRole.SUPER_ADMIN) {
+    if (!firebaseUser || profile?.role !== UserRole.SUPER_ADMIN || profile?.status !== UserStatus.ACTIVE) {
       setAvailableGyms([]);
       return;
     }
@@ -216,14 +250,14 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       () => {}
     );
     return () => unsub();
-  }, [firebaseUser, profile?.role, superAdminGymId]);
+  }, [firebaseUser, profile?.role, profile?.status, superAdminGymId]);
 
   const effectiveGymId =
     profile?.role === UserRole.SUPER_ADMIN ? superAdminGymId : profile?.gymId ?? null;
 
-  // Subscribe to tenant gym document & staff permissions
+  // Subscribe to tenant gym document & staff permissions (live revocation on staff doc)
   useEffect(() => {
-    if (!firebaseUser || !effectiveGymId) {
+    if (!firebaseUser || !effectiveGymId || profile?.status === UserStatus.DEACTIVATED) {
       setGym(null);
       setStaffRecord(null);
       return;
@@ -256,7 +290,6 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
               }
             },
             () => {
-              // Staff doc is inaccessible when gym is SUSPENDED; handled by suspended lock screen
               setStaffRecord(null);
             }
           );
@@ -265,7 +298,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       unsubGym();
       unsubStaff();
     };
-  }, [firebaseUser, effectiveGymId, profile?.role]);
+  }, [firebaseUser, effectiveGymId, profile?.role, profile?.status]);
 
   const enterGymWorkspace = (gymId: string) => {
     if (profile?.role !== UserRole.SUPER_ADMIN) return;
@@ -305,20 +338,38 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
   const refreshProfile = async () => {
     if (firebaseUser) {
-      await loadUserWorkspace(firebaseUser);
+      await syncUserAccount(firebaseUser);
     }
   };
 
+  const subscriptionAccess: SubscriptionAccessState | null = gym
+    ? evaluateGymSubscriptionAccess(gym, toIsoDate())
+    : null;
+
+  const isStaffActive =
+    profile?.role === UserRole.GYM_OWNER ||
+    profile?.role === UserRole.SUPER_ADMIN ||
+    staffRecord?.status === UserStatus.ACTIVE;
+
   const effectivePermissions: StaffPermissions =
     profile?.role === UserRole.GYM_OWNER || profile?.role === UserRole.SUPER_ADMIN
-      ? {
-          canViewReports: true,
-          canManagePlans: true,
-          canConfirmPayments: true,
-          canDeleteMembers: true,
-          canManageReminders: true,
-        }
-      : staffRecord?.permissions ?? DEFAULT_PERMISSIONS;
+      ? FULL_PERMISSIONS
+      : !isStaffActive || !staffRecord
+        ? DEFAULT_PERMISSIONS
+        : {
+            canViewReports: Boolean(staffRecord.permissions?.canViewReports),
+            canViewPayments:
+              staffRecord.permissions?.canViewPayments ??
+              profile?.role !== UserRole.GYM_TRAINER,
+            canRecordPayments:
+              staffRecord.permissions?.canRecordPayments ??
+              profile?.role !== UserRole.GYM_TRAINER,
+            canManagePlans: Boolean(staffRecord.permissions?.canManagePlans),
+            canConfirmPayments: Boolean(staffRecord.permissions?.canConfirmPayments),
+            canDeleteMembers: Boolean(staffRecord.permissions?.canDeleteMembers),
+            canManageReminders: Boolean(staffRecord.permissions?.canManageReminders),
+            canManageAttendance: staffRecord.permissions?.canManageAttendance ?? true,
+          };
 
   return (
     <AuthContext.Provider
@@ -326,6 +377,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         firebaseUser,
         profile,
         gym,
+        subscriptionAccess,
         availableGyms,
         superAdminGymId,
         staffRecord,

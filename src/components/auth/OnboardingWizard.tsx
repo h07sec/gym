@@ -3,7 +3,7 @@ import { collection, getDocs, query, where } from 'firebase/firestore';
 import { Building2, CheckCircle2, LogOut, UserCheck } from 'lucide-react';
 import { db } from '../../lib/firebase';
 import { useAuth } from '../../contexts/AuthContext';
-import { SubscriptionPlan, StaffInvitation } from '../../types/gymos';
+import { SubscriptionPlan, StaffInvitation, UserRole } from '../../types/gymos';
 import {
   acceptStaffInvitation,
   registerGymAsOwner,
@@ -123,12 +123,17 @@ export const OnboardingWizard: React.FC = () => {
             <div className="flex items-center gap-2.5">
               <UserCheck className="w-5 h-5 text-teal-700" />
               <h2 className="text-base font-semibold text-slate-900">
-                Pending Staff Invitations
+                Pending Workspace Invitations
               </h2>
             </div>
             <p className="text-sm text-slate-600">
-              You have been invited to join an existing gym workspace. Accept the invitation below to activate your staff account.
+              You have been invited to join an existing gym workspace. Accept the invitation below to activate your account.
             </p>
+            {error && (
+              <div className="p-3 bg-red-50 border border-red-200 rounded-md text-xs text-red-700">
+                {error}
+              </div>
+            )}
             <div className="divide-y divide-slate-200 border border-slate-200 rounded-md">
               {pendingInvitations.map((inv) => (
                 <div
@@ -138,7 +143,11 @@ export const OnboardingWizard: React.FC = () => {
                   <div>
                     <p className="text-sm font-medium text-slate-900">{inv.gymName}</p>
                     <p className="text-xs text-slate-500 mt-0.5">
-                      Role: {inv.role.replace('GYM_', '')} · Invited as {inv.fullName}
+                      Role:{' '}
+                      {inv.role === UserRole.GYM_OWNER
+                        ? 'Gym Owner'
+                        : inv.roleTitle || inv.role.replace('GYM_', '')}{' '}
+                      · Invited as {inv.fullName}
                     </p>
                   </div>
                   <button
@@ -147,7 +156,7 @@ export const OnboardingWizard: React.FC = () => {
                     onClick={() => handleAcceptInvite(inv)}
                     className="px-4 py-2 text-xs font-medium text-white bg-teal-700 rounded-md hover:bg-teal-800 disabled:opacity-50 cursor-pointer whitespace-nowrap"
                   >
-                    Accept Invitation
+                    {inv.role === UserRole.GYM_OWNER ? 'Claim Gym Workspace' : 'Accept Invitation'}
                   </button>
                 </div>
               ))}
@@ -161,7 +170,7 @@ export const OnboardingWizard: React.FC = () => {
               Self-registration is currently closed
             </h2>
             <p className="text-sm text-slate-600">
-              Please contact GymOS support{platformSettings?.supportEmail ? ` (${platformSettings.supportEmail})` : ''} to set up your gym account or request a staff invitation.
+              Please contact GymOS support{platformSettings?.supportEmail ? ` (${platformSettings.supportEmail})` : ''} to provision your gym account or request an invitation.
             </p>
           </div>
         ) : (

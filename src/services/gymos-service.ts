@@ -1,8 +1,10 @@
 import {
+  Timestamp,
   collection,
   doc,
   getDoc,
   getDocs,
+  limit,
   query,
   runTransaction,
   serverTimestamp,
@@ -11,10 +13,12 @@ import {
   where,
   writeBatch,
 } from 'firebase/firestore';
-import { db } from '../lib/firebase';
+import { auth, db } from '../lib/firebase';
 import { handleFirestoreError, OperationType } from '../lib/firestore-error';
 import {
   AccountStatus,
+  AssignableStaffRole,
+  AttendanceRecord,
   DeliveryStatus,
   Gym,
   GymSettings,
@@ -32,6 +36,7 @@ import {
   NotificationLog,
   PaymentMode,
   PaymentReceipt,
+  PlatformAdmin,
   PlatformSettings,
   ReminderChannel,
   RenewalPolicy,
@@ -41,7 +46,6 @@ import {
   SubscriptionPaymentStatus,
   SubscriptionPlan,
   SubscriptionStatus,
-  UserProfile,
   UserRole,
   UserStatus,
 } from '../types/gymos';
@@ -53,11 +57,14 @@ import {
   deriveMemberMembershipStatus,
 } from '../lib/domain/dates';
 import {
+  calculateNetPlanAmount,
   calculateOutstandingAfterPayment,
   isDuplicateUpiReference,
+  isPotentialDuplicateCashPayment,
   validatePaymentConfirmationTransition,
 } from '../lib/domain/payments';
-import { evaluateDueReminders, computeNextRetryState } from '../lib/domain/reminders';
+import { computeNextRetryState, evaluateDueReminders } from '../lib/domain/reminders';
+import { computeEffectiveAccessEndIso } from '../lib/domain/subscription';
 import { generateHumanCode, generateSecureId, toIsoDate } from '../lib/utils';
 
 export interface ActorContext {
@@ -65,6 +72,50 @@ export interface ActorContext {
   email: string;
   displayName: string;
   role: UserRole;
+}
+
+export interface ServerCapabilities {
+  emailConfigured: boolean;
+  whatsappConfigured: boolean;
+  adminFirestoreConfigured: boolean;
+  adminBootstrapConfigured: boolean;
+  cronConfigured: boolean;
+  smtpFrom?: string;
+}
+
+export interface GymBackupPayload {
+  schemaVersion: 'gymos.backup.v1';
+  exportedAt: string;
+  gymId: string;
+  gymName: string;
+  settings: GymSettings | null;
+  membershipPlans: MembershipPlan[];
+  members: Member[];
+  memberships: Membership[];
+  memberPayments: MemberPayment[];
+  paymentReceipts: PaymentReceipt[];
+  attendance: AttendanceRecord[];
+  notificationLogs: NotificationLog[];
+}
+
+function buildSubscriptionAccessTimestamp(
+  endAtIso: string,
+  graceDays: number,
+  status: SubscriptionStatus
+): Timestamp {
+  if (status === SubscriptionStatus.PENDING || status === SubscriptionStatus.CANCELLED) {
+    return Timestamp.fromDate(new Date('1970-01-01T00:00:00.000Z'));
+  }
+  const effectiveIso = computeEffectiveAccessEndIso(endAtIso, graceDays);
+  if (!effectiveIso) {
+    return Timestamp.fromDate(new Date('1970-01-01T00:00:00.000Z'));
+  }
+  if (status === SubscriptionStatus.EXPIRED) {
+    const yesterday = addDaysSafe(toIsoDate(), -1);
+    const chosen = effectiveIso < yesterday ? effectiveIso : yesterday;
+    return Timestamp.fromDate(new Date(`${chosen}T23:59:59.999Z`));
+  }
+  return Timestamp.fromDate(new Date(`${effectiveIso}T23:59:59.999Z`));
 }
 
 async function appendAuditLog(
@@ -93,8 +144,178 @@ async function appendAuditLog(
 }
 
 // ---------------------------------------------------------------------------
-// Platform Bootstrap & Settings (Super Admin Only)
+// Server Notification & Capability Calls
 // ---------------------------------------------------------------------------
+export async function fetchServerNotificationCapabilities(): Promise<ServerCapabilities> {
+  try {
+    const resp = await fetch('/api/notifications/capabilities');
+    if (!resp.ok) {
+      return {
+        emailConfigured: false,
+        whatsappConfigured: false,
+        adminFirestoreConfigured: false,
+        adminBootstrapConfigured: false,
+        cronConfigured: false,
+      };
+    }
+    return (await resp.json()) as ServerCapabilities;
+  } catch {
+    return {
+      emailConfigured: false,
+      whatsappConfigured: false,
+      adminFirestoreConfigured: false,
+      adminBootstrapConfigured: false,
+      cronConfigured: false,
+    };
+  }
+}
+
+async function dispatchExternalReminder(payload: {
+  channel: ReminderChannel.EMAIL | ReminderChannel.WHATSAPP_CLOUD;
+  recipient: string;
+  subject: string;
+  message: string;
+  fromName?: string;
+  whatsappPhoneNumberId?: string;
+  whatsappApprovedTemplate?: string;
+  whatsappTemplateParams?: string[];
+}): Promise<{
+  delivered: boolean;
+  providerMessageId?: string;
+  sentAt?: string;
+  errorDetails?: string;
+}> {
+  const user = auth.currentUser;
+  if (!user) {
+    return {
+      delivered: false,
+      errorDetails: 'Authenticated user session required for server notification delivery.',
+    };
+  }
+  try {
+    const idToken = await user.getIdToken();
+    const resp = await fetch('/api/notifications/send', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${idToken}`,
+      },
+      body: JSON.stringify(payload),
+    });
+    const json = (await resp.json().catch(() => ({}))) as {
+      delivered?: boolean;
+      providerMessageId?: string;
+      sentAt?: string;
+      errorDetails?: string;
+    };
+    if (!resp.ok || !json.delivered) {
+      return {
+        delivered: false,
+        errorDetails: json.errorDetails || `Delivery endpoint returned HTTP ${resp.status}`,
+      };
+    }
+    return {
+      delivered: true,
+      providerMessageId: json.providerMessageId,
+      sentAt: json.sentAt || new Date().toISOString(),
+    };
+  } catch (err) {
+    return {
+      delivered: false,
+      errorDetails: err instanceof Error ? err.message : 'Network error calling notification server',
+    };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Platform Bootstrap, Admin Registry & Settings (Super Admin Only)
+// ---------------------------------------------------------------------------
+export async function addPlatformAdmin(
+  actor: ActorContext,
+  input: { uid: string; email: string; displayName: string }
+): Promise<void> {
+  const uid = input.uid.trim();
+  const email = input.email.trim().toLowerCase();
+  const displayName = input.displayName.trim() || email.split('@')[0] || 'Platform Admin';
+  if (!uid || !email) {
+    throw new Error('Firebase UID and verified email are required.');
+  }
+  const path = `platform_admins/${uid}`;
+  try {
+    const batch = writeBatch(db);
+    batch.set(doc(db, 'platform_admins', uid), {
+      uid,
+      email,
+      displayName,
+      createdAt: serverTimestamp(),
+    });
+    const userRef = doc(db, 'users', uid);
+    const existingUser = await getDoc(userRef);
+    if (existingUser.exists()) {
+      batch.update(userRef, {
+        displayName,
+        role: UserRole.SUPER_ADMIN,
+        status: UserStatus.ACTIVE,
+        updatedAt: serverTimestamp(),
+      });
+    } else {
+      batch.set(userRef, {
+        uid,
+        email,
+        displayName,
+        role: UserRole.SUPER_ADMIN,
+        status: UserStatus.ACTIVE,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+    }
+    await appendAuditLog(
+      batch,
+      actor,
+      'ADD_PLATFORM_ADMIN',
+      'PlatformAdmin',
+      uid,
+      `Authorized platform Super Admin ${email}`
+    );
+    await batch.commit();
+  } catch (error) {
+    handleFirestoreError(error, OperationType.WRITE, path);
+  }
+}
+
+export async function revokePlatformAdmin(
+  actor: ActorContext,
+  target: PlatformAdmin
+): Promise<void> {
+  if (target.uid === actor.uid) {
+    throw new Error('You cannot revoke your own active Super Admin access.');
+  }
+  const path = `platform_admins/${target.uid}`;
+  try {
+    const batch = writeBatch(db);
+    batch.delete(doc(db, 'platform_admins', target.uid));
+    const userRef = doc(db, 'users', target.uid);
+    const userSnap = await getDoc(userRef);
+    if (userSnap.exists()) {
+      batch.update(userRef, {
+        status: UserStatus.DEACTIVATED,
+        updatedAt: serverTimestamp(),
+      });
+    }
+    await appendAuditLog(
+      batch,
+      actor,
+      'REVOKE_PLATFORM_ADMIN',
+      'PlatformAdmin',
+      target.uid,
+      `Revoked platform Super Admin ${target.email}`
+    );
+    await batch.commit();
+  } catch (error) {
+    handleFirestoreError(error, OperationType.DELETE, path);
+  }
+}
+
 export async function ensurePlatformDefaults(actor: ActorContext): Promise<void> {
   const settingsRef = doc(db, 'platform_settings', 'default');
   try {
@@ -302,6 +523,17 @@ export async function saveSubscriptionPlan(
 // ---------------------------------------------------------------------------
 // Gym Onboarding (Public Owner Registration & Super Admin Manual Creation)
 // ---------------------------------------------------------------------------
+const FULL_OWNER_PERMISSIONS: StaffPermissions = {
+  canViewReports: true,
+  canViewPayments: true,
+  canRecordPayments: true,
+  canManagePlans: true,
+  canConfirmPayments: true,
+  canDeleteMembers: true,
+  canManageReminders: true,
+  canManageAttendance: true,
+};
+
 export async function registerGymAsOwner(input: {
   uid: string;
   email: string;
@@ -314,10 +546,13 @@ export async function registerGymAsOwner(input: {
 }): Promise<string> {
   const gymId = generateSecureId('gym');
   const today = toIsoDate();
+  const subStatus =
+    input.startMode === 'TRIAL' ? SubscriptionStatus.TRIAL : SubscriptionStatus.PENDING;
   const endAt =
     input.startMode === 'TRIAL'
       ? addDaysSafe(today, Math.max(1, input.plan.trialDays || 14))
       : today;
+  const graceDays = 7;
 
   try {
     const batch = writeBatch(db);
@@ -338,13 +573,13 @@ export async function registerGymAsOwner(input: {
       phone: input.phone.trim(),
       ...(input.address?.trim() ? { address: input.address.trim() } : {}),
       accountStatus: AccountStatus.ACTIVE,
-      subscriptionStatus:
-        input.startMode === 'TRIAL' ? SubscriptionStatus.TRIAL : SubscriptionStatus.PENDING,
+      subscriptionStatus: subStatus,
       subscriptionPlanId: input.plan.id,
       subscriptionPlanName: input.plan.name,
       subscriptionStartAt: today,
       subscriptionEndAt: endAt,
-      gracePeriodDays: 7,
+      subscriptionAccessUntil: buildSubscriptionAccessTimestamp(endAt, graceDays, subStatus),
+      gracePeriodDays: graceDays,
       renewalPolicy: RenewalPolicy.EXTEND_FROM_EXPIRY,
       createdAt: serverTimestamp(),
       updatedAt: serverTimestamp(),
@@ -369,25 +604,24 @@ export async function registerGymAsOwner(input: {
       fullName: input.ownerName.trim(),
       phone: input.phone.trim(),
       role: UserRole.GYM_OWNER,
+      roleTitle: 'Gym Owner',
       status: UserStatus.ACTIVE,
-      permissions: {
-        canViewReports: true,
-        canManagePlans: true,
-        canConfirmPayments: true,
-        canDeleteMembers: true,
-        canManageReminders: true,
-      },
+      permissions: FULL_OWNER_PERMISSIONS,
       createdAt: serverTimestamp(),
       updatedAt: serverTimestamp(),
     });
 
     batch.set(settingsRef, {
       gymId,
-      gracePeriodDays: 7,
+      gracePeriodDays: graceDays,
       renewalPolicy: RenewalPolicy.EXTEND_FROM_EXPIRY,
       reminderDaysBefore: [7, 3, 1],
       sendOnExpiryDay: true,
       sendAfterExpiryDays: [3, 7],
+      paymentRemindersEnabled: true,
+      upcomingPaymentReminderDays: 3,
+      overduePaymentReminderDays: [1, 3, 7, 14],
+      ownerSubReminderDays: [7, 3, 1, 0, -3],
       emailEnabled: true,
       emailFromName: input.gymName.trim(),
       inAppEnabled: true,
@@ -439,15 +673,19 @@ export async function createGymBySuperAdmin(
     plan: SubscriptionPlan;
     subscriptionStatus: SubscriptionStatus;
     accountStatus: AccountStatus;
+    gracePeriodDays?: number;
   }
 ): Promise<string> {
   const gymId = generateSecureId('gym');
+  const ownerInviteId = generateSecureId('inv');
   const today = toIsoDate();
   const endAt =
     input.subscriptionStatus === SubscriptionStatus.TRIAL
       ? addDaysSafe(today, Math.max(1, input.plan.trialDays || 14))
       : addMonthsSafe(today, input.plan.billingDurationMonths);
   const placeholderOwnerUid = generateSecureId('owner_pending');
+  const graceDays = Math.max(0, input.gracePeriodDays ?? 7);
+  const cleanEmail = input.ownerEmail.trim().toLowerCase();
 
   try {
     const batch = writeBatch(db);
@@ -456,7 +694,7 @@ export async function createGymBySuperAdmin(
       name: input.gymName.trim(),
       ownerUid: placeholderOwnerUid,
       ownerName: input.ownerName.trim(),
-      email: input.ownerEmail.trim().toLowerCase(),
+      email: cleanEmail,
       phone: input.phone.trim(),
       ...(input.address?.trim() ? { address: input.address.trim() } : {}),
       accountStatus: input.accountStatus,
@@ -465,19 +703,44 @@ export async function createGymBySuperAdmin(
       subscriptionPlanName: input.plan.name,
       subscriptionStartAt: today,
       subscriptionEndAt: endAt,
-      gracePeriodDays: 7,
+      subscriptionAccessUntil: buildSubscriptionAccessTimestamp(
+        endAt,
+        graceDays,
+        input.subscriptionStatus
+      ),
+      ownerInvitationId: ownerInviteId,
+      gracePeriodDays: graceDays,
       renewalPolicy: RenewalPolicy.EXTEND_FROM_EXPIRY,
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
+
+    batch.set(doc(db, 'invitations', ownerInviteId), {
+      id: ownerInviteId,
+      gymId,
+      gymName: input.gymName.trim(),
+      email: cleanEmail,
+      fullName: input.ownerName.trim(),
+      role: UserRole.GYM_OWNER,
+      roleTitle: 'Gym Owner',
+      permissions: FULL_OWNER_PERMISSIONS,
+      status: 'PENDING',
+      invitedByUid: actor.uid,
       createdAt: serverTimestamp(),
       updatedAt: serverTimestamp(),
     });
 
     batch.set(doc(db, 'gyms', gymId, 'settings', 'default'), {
       gymId,
-      gracePeriodDays: 7,
+      gracePeriodDays: graceDays,
       renewalPolicy: RenewalPolicy.EXTEND_FROM_EXPIRY,
       reminderDaysBefore: [7, 3, 1],
       sendOnExpiryDay: true,
       sendAfterExpiryDays: [3, 7],
+      paymentRemindersEnabled: true,
+      upcomingPaymentReminderDays: 3,
+      overduePaymentReminderDays: [1, 3, 7, 14],
+      ownerSubReminderDays: [7, 3, 1, 0, -3],
       emailEnabled: true,
       emailFromName: input.gymName.trim(),
       inAppEnabled: true,
@@ -492,13 +755,74 @@ export async function createGymBySuperAdmin(
       'ADMIN_CREATE_GYM',
       'Gym',
       gymId,
-      `Super Admin created gym ${input.gymName.trim()} (${input.ownerEmail})`,
+      `Super Admin created gym ${input.gymName.trim()} and owner invitation for ${cleanEmail}`,
       gymId
     );
     await batch.commit();
     return gymId;
   } catch (error) {
     handleFirestoreError(error, OperationType.CREATE, `gyms/${gymId}`);
+  }
+}
+
+export async function claimOwnerInvitation(
+  invitation: StaffInvitation,
+  user: { uid: string; email: string; displayName: string }
+): Promise<void> {
+  const path = `gyms/${invitation.gymId}`;
+  try {
+    const batch = writeBatch(db);
+    batch.update(doc(db, 'invitations', invitation.id), {
+      status: 'ACCEPTED',
+      acceptedByUid: user.uid,
+      updatedAt: serverTimestamp(),
+    });
+    batch.update(doc(db, 'gyms', invitation.gymId), {
+      ownerUid: user.uid,
+      updatedAt: serverTimestamp(),
+    });
+    batch.set(doc(db, 'users', user.uid), {
+      uid: user.uid,
+      email: user.email.toLowerCase(),
+      displayName: user.displayName || invitation.fullName,
+      role: UserRole.GYM_OWNER,
+      gymId: invitation.gymId,
+      invitationId: invitation.id,
+      status: UserStatus.ACTIVE,
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
+    batch.set(doc(db, 'gyms', invitation.gymId, 'staff', user.uid), {
+      id: user.uid,
+      gymId: invitation.gymId,
+      uid: user.uid,
+      invitationId: invitation.id,
+      email: user.email.toLowerCase(),
+      fullName: user.displayName || invitation.fullName,
+      role: UserRole.GYM_OWNER,
+      roleTitle: 'Gym Owner',
+      status: UserStatus.ACTIVE,
+      permissions: FULL_OWNER_PERMISSIONS,
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
+    await appendAuditLog(
+      batch,
+      {
+        uid: user.uid,
+        email: user.email,
+        displayName: user.displayName || invitation.fullName,
+        role: UserRole.GYM_OWNER,
+      },
+      'CLAIM_OWNER_INVITATION',
+      'Gym',
+      invitation.gymId,
+      `${user.email} claimed owner access for ${invitation.gymName}`,
+      invitation.gymId
+    );
+    await batch.commit();
+  } catch (error) {
+    handleFirestoreError(error, OperationType.WRITE, path);
   }
 }
 
@@ -514,6 +838,7 @@ export async function updateGymAccountState(
     subscriptionPlanId?: string;
     subscriptionPlanName?: string;
     subscriptionEndAt?: string;
+    gracePeriodDays?: number;
     suspensionReason?: string;
   },
   auditSummary: string
@@ -522,6 +847,10 @@ export async function updateGymAccountState(
   try {
     const batch = writeBatch(db);
     const gymRef = doc(db, 'gyms', gym.id);
+    const nextEnd = updates.subscriptionEndAt ?? gym.subscriptionEndAt;
+    const nextStatus = updates.subscriptionStatus ?? gym.subscriptionStatus;
+    const nextGrace = updates.gracePeriodDays ?? gym.gracePeriodDays;
+
     const payload: Record<string, unknown> = {
       updatedAt: serverTimestamp(),
     };
@@ -534,8 +863,22 @@ export async function updateGymAccountState(
       payload.subscriptionPlanName = updates.subscriptionPlanName;
     if (updates.subscriptionEndAt !== undefined)
       payload.subscriptionEndAt = updates.subscriptionEndAt;
+    if (updates.gracePeriodDays !== undefined)
+      payload.gracePeriodDays = updates.gracePeriodDays;
     if (updates.suspensionReason !== undefined)
       payload.suspensionReason = updates.suspensionReason;
+
+    if (
+      updates.subscriptionEndAt !== undefined ||
+      updates.subscriptionStatus !== undefined ||
+      updates.gracePeriodDays !== undefined
+    ) {
+      payload.subscriptionAccessUntil = buildSubscriptionAccessTimestamp(
+        nextEnd,
+        nextGrace,
+        nextStatus
+      );
+    }
 
     batch.update(gymRef, payload);
 
@@ -567,6 +910,7 @@ export async function recordManualSubscriptionPayment(
     periodEnd: string;
     notes?: string;
     verifyImmediately: boolean;
+    initialStatus?: SubscriptionPaymentStatus.PENDING | SubscriptionPaymentStatus.RECORDED;
   }
 ): Promise<string> {
   const paymentId = generateSecureId('spay');
@@ -574,7 +918,6 @@ export async function recordManualSubscriptionPayment(
   const path = `subscription_payments/${paymentId}`;
 
   try {
-    // Check duplicate transaction reference for UPI
     if (input.paymentMode === PaymentMode.UPI && input.transactionReference?.trim()) {
       const dupQuery = query(
         collection(db, 'subscription_payments'),
@@ -599,7 +942,7 @@ export async function recordManualSubscriptionPayment(
 
       const status = input.verifyImmediately
         ? SubscriptionPaymentStatus.VERIFIED
-        : SubscriptionPaymentStatus.RECORDED;
+        : input.initialStatus || SubscriptionPaymentStatus.RECORDED;
 
       tx.set(payRef, {
         id: paymentId,
@@ -634,6 +977,11 @@ export async function recordManualSubscriptionPayment(
           subscriptionPlanName: input.plan.name,
           subscriptionStartAt: input.periodStart,
           subscriptionEndAt: input.periodEnd,
+          subscriptionAccessUntil: buildSubscriptionAccessTimestamp(
+            input.periodEnd,
+            currentGym.gracePeriodDays ?? 7,
+            SubscriptionStatus.ACTIVE
+          ),
           suspensionReason: '',
           updatedAt: serverTimestamp(),
         });
@@ -647,7 +995,7 @@ export async function recordManualSubscriptionPayment(
           : 'RECORD_SUBSCRIPTION_PAYMENT',
         'SubscriptionPayment',
         paymentId,
-        `${input.verifyImmediately ? 'Verified & extended' : 'Recorded'} ${input.paymentMode} payment of ${input.amount} for ${currentGym.name} (${input.periodStart} to ${input.periodEnd})`,
+        `${input.verifyImmediately ? 'Verified & extended' : `Recorded (${status})`} ${input.paymentMode} payment of ${input.amount} for ${currentGym.name} (${input.periodStart} to ${input.periodEnd})`,
         currentGym.id
       );
     });
@@ -673,7 +1021,11 @@ export async function verifyExistingSubscriptionPayment(
       if (!paySnap.exists()) throw new Error('Subscription payment record not found.');
       const payment = paySnap.data() as SubscriptionPayment;
 
-      if (payment.status !== SubscriptionPaymentStatus.RECORDED || payment.extensionApplied) {
+      if (
+        (payment.status !== SubscriptionPaymentStatus.RECORDED &&
+          payment.status !== SubscriptionPaymentStatus.PENDING) ||
+        payment.extensionApplied
+      ) {
         throw new Error(
           'This payment has already been processed. Double extension is prevented.'
         );
@@ -682,6 +1034,7 @@ export async function verifyExistingSubscriptionPayment(
       const gymRef = doc(db, 'gyms', payment.gymId);
       const gymSnap = await tx.get(gymRef);
       if (!gymSnap.exists()) throw new Error('Associated gym not found.');
+      const currentGym = gymSnap.data() as Gym;
 
       tx.update(payRef, {
         status: SubscriptionPaymentStatus.VERIFIED,
@@ -697,6 +1050,11 @@ export async function verifyExistingSubscriptionPayment(
         subscriptionPlanName: payment.planName,
         subscriptionStartAt: payment.periodStart,
         subscriptionEndAt: payment.periodEnd,
+        subscriptionAccessUntil: buildSubscriptionAccessTimestamp(
+          payment.periodEnd,
+          currentGym.gracePeriodDays ?? 7,
+          SubscriptionStatus.ACTIVE
+        ),
         suspensionReason: '',
         updatedAt: serverTimestamp(),
       });
@@ -722,6 +1080,45 @@ export async function verifyExistingSubscriptionPayment(
   }
 }
 
+export async function rejectSubscriptionPayment(
+  actor: ActorContext,
+  payment: SubscriptionPayment,
+  reason: string
+): Promise<void> {
+  const path = `subscription_payments/${payment.id}`;
+  try {
+    await runTransaction(db, async (tx) => {
+      const payRef = doc(db, 'subscription_payments', payment.id);
+      const paySnap = await tx.get(payRef);
+      if (!paySnap.exists()) throw new Error('Subscription payment not found.');
+      const current = paySnap.data() as SubscriptionPayment;
+      if (
+        current.status !== SubscriptionPaymentStatus.PENDING &&
+        current.status !== SubscriptionPaymentStatus.RECORDED
+      ) {
+        throw new Error('Only pending or recorded subscription payments can be rejected.');
+      }
+      tx.update(payRef, {
+        status: SubscriptionPaymentStatus.REJECTED,
+        verifiedByUid: actor.uid,
+        notes: `${current.notes ? `${current.notes} | ` : ''}REJECTED: ${reason}`.slice(0, 500),
+        updatedAt: serverTimestamp(),
+      });
+      await appendAuditLog(
+        tx,
+        actor,
+        'REJECT_SUBSCRIPTION_PAYMENT',
+        'SubscriptionPayment',
+        payment.id,
+        `Rejected subscription payment ${payment.id} for ${payment.gymName}: ${reason}`,
+        payment.gymId
+      );
+    });
+  } catch (error) {
+    handleFirestoreError(error, OperationType.UPDATE, path);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Staff Invitations & Management
 // ---------------------------------------------------------------------------
@@ -731,7 +1128,8 @@ export async function createStaffInvitation(
   input: {
     email: string;
     fullName: string;
-    role: UserRole.GYM_MANAGER | UserRole.GYM_RECEPTIONIST;
+    role: AssignableStaffRole;
+    roleTitle?: string;
     permissions: StaffPermissions;
   }
 ): Promise<string> {
@@ -746,6 +1144,7 @@ export async function createStaffInvitation(
       email: input.email.trim().toLowerCase(),
       fullName: input.fullName.trim(),
       role: input.role,
+      ...(input.roleTitle?.trim() ? { roleTitle: input.roleTitle.trim().slice(0, 64) } : {}),
       permissions: input.permissions,
       status: 'PENDING',
       invitedByUid: actor.uid,
@@ -772,6 +1171,9 @@ export async function acceptStaffInvitation(
   invitation: StaffInvitation,
   user: { uid: string; email: string; displayName: string }
 ): Promise<void> {
+  if (invitation.role === UserRole.GYM_OWNER) {
+    return claimOwnerInvitation(invitation, user);
+  }
   const path = `invitations/${invitation.id}`;
   try {
     const batch = writeBatch(db);
@@ -801,6 +1203,7 @@ export async function acceptStaffInvitation(
       email: user.email.toLowerCase(),
       fullName: user.displayName || invitation.fullName,
       role: invitation.role,
+      ...(invitation.roleTitle ? { roleTitle: invitation.roleTitle } : {}),
       status: UserStatus.ACTIVE,
       permissions: invitation.permissions,
       createdAt: serverTimestamp(),
@@ -833,7 +1236,8 @@ export async function updateGymStaffMember(
   gymId: string,
   staff: GymStaff,
   updates: {
-    role?: UserRole.GYM_MANAGER | UserRole.GYM_RECEPTIONIST;
+    role?: AssignableStaffRole;
+    roleTitle?: string;
     status?: UserStatus;
     permissions?: StaffPermissions;
   }
@@ -843,6 +1247,7 @@ export async function updateGymStaffMember(
     const batch = writeBatch(db);
     batch.update(doc(db, 'gyms', gymId, 'staff', staff.id), {
       ...(updates.role ? { role: updates.role } : {}),
+      ...(updates.roleTitle !== undefined ? { roleTitle: updates.roleTitle.trim().slice(0, 64) } : {}),
       ...(updates.status ? { status: updates.status } : {}),
       ...(updates.permissions ? { permissions: updates.permissions } : {}),
       updatedAt: serverTimestamp(),
@@ -968,6 +1373,33 @@ export async function deleteMembershipPlan(
 ): Promise<void> {
   const path = `gyms/${gymId}/membership_plans/${plan.id}`;
   try {
+    // Prevent deleting a plan actively assigned to members or referenced by memberships
+    const inUseMembers = await getDocs(
+      query(
+        collection(db, 'gyms', gymId, 'members'),
+        where('currentPlanId', '==', plan.id),
+        limit(1)
+      )
+    );
+    if (!inUseMembers.empty) {
+      throw new Error(
+        `Plan "${plan.name}" is currently assigned to one or more members. Mark it INACTIVE instead of deleting.`
+      );
+    }
+
+    const inUseHistory = await getDocs(
+      query(
+        collection(db, 'gyms', gymId, 'memberships'),
+        where('planId', '==', plan.id),
+        limit(1)
+      )
+    );
+    if (!inUseHistory.empty) {
+      throw new Error(
+        `Plan "${plan.name}" has existing membership history. Mark it INACTIVE to preserve historical records.`
+      );
+    }
+
     const batch = writeBatch(db);
     batch.delete(doc(db, 'gyms', gymId, 'membership_plans', plan.id));
     await appendAuditLog(
@@ -981,12 +1413,15 @@ export async function deleteMembershipPlan(
     );
     await batch.commit();
   } catch (error) {
+    if (error instanceof Error && error.message.includes('INACTIVE')) {
+      throw error;
+    }
     handleFirestoreError(error, OperationType.DELETE, path);
   }
 }
 
 // ---------------------------------------------------------------------------
-// Member Registration, Update, CSV Import, Archive
+// Member Registration, Update, CSV Import, Archive, Attendance
 // ---------------------------------------------------------------------------
 export async function createGymMember(
   actor: ActorContext,
@@ -1004,6 +1439,9 @@ export async function createGymMember(
     reminderOptOut?: boolean;
     initialPlan?: MembershipPlan;
     startDate?: string;
+    discountAmount?: number;
+    discountReason?: string;
+    dueDate?: string;
     paymentAmount?: number;
     paymentMode?: PaymentMode;
     transactionReference?: string;
@@ -1033,11 +1471,15 @@ export async function createGymMember(
       membershipExpiryDate = expiry;
       membershipStatus = deriveMemberMembershipStatus(expiry, today);
 
+      const { discount, netPrice } = calculateNetPlanAmount(
+        input.initialPlan.price,
+        input.discountAmount
+      );
       const paidConfirmed =
         input.paymentAmount && input.paymentAmount > 0 && input.confirmPaymentNow
           ? input.paymentAmount
           : 0;
-      outstandingBalance = Math.max(0, Number((input.initialPlan.price - paidConfirmed).toFixed(2)));
+      outstandingBalance = Math.max(0, Number((netPrice - paidConfirmed).toFixed(2)));
 
       const membershipId = generateSecureId('ms');
       batch.set(doc(db, 'gyms', gym.id, 'memberships', membershipId), {
@@ -1051,8 +1493,13 @@ export async function createGymMember(
         startDate: start,
         expiryDate: expiry,
         planPrice: input.initialPlan.price,
+        ...(discount > 0 ? { discountAmount: discount } : {}),
+        ...(discount > 0 && input.discountReason?.trim()
+          ? { discountReason: input.discountReason.trim().slice(0, 200) }
+          : {}),
         amountPaid: paidConfirmed,
         balanceDue: outstandingBalance,
+        ...(input.dueDate ? { dueDate: input.dueDate } : {}),
         status: MembershipRecordStatus.ACTIVE,
         recordedByUid: actor.uid,
         createdAt: serverTimestamp(),
@@ -1071,12 +1518,17 @@ export async function createGymMember(
           memberName: input.fullName.trim(),
           membershipId,
           amount: input.paymentAmount,
+          ...(discount > 0 ? { discountAmount: discount } : {}),
+          ...(discount > 0 && input.discountReason?.trim()
+            ? { discountReason: input.discountReason.trim().slice(0, 200) }
+            : {}),
           paymentMode: input.paymentMode || PaymentMode.CASH,
           paymentPurpose: MemberPaymentPurpose.MEMBERSHIP,
           ...(input.transactionReference?.trim()
             ? { transactionReference: input.transactionReference.trim() }
             : {}),
           paymentDate: today,
+          ...(input.dueDate ? { dueDate: input.dueDate } : {}),
           status: input.confirmPaymentNow
             ? MemberPaymentStatus.CONFIRMED
             : MemberPaymentStatus.PENDING,
@@ -1293,7 +1745,67 @@ export async function bulkImportGymMembers(
 }
 
 // ---------------------------------------------------------------------------
-// Membership Renewal / Upgrade / Downgrade / Manual Extension
+// Attendance Check-In & Check-Out
+// ---------------------------------------------------------------------------
+export async function recordAttendanceCheckIn(
+  actor: ActorContext,
+  gymId: string,
+  member: Member,
+  notes?: string
+): Promise<string> {
+  const attendanceId = generateSecureId('att');
+  const now = new Date();
+  const checkInDate = toIsoDate(now);
+  const checkInTime = now.toISOString();
+  const path = `gyms/${gymId}/attendance/${attendanceId}`;
+
+  try {
+    const batch = writeBatch(db);
+    batch.set(doc(db, 'gyms', gymId, 'attendance', attendanceId), {
+      id: attendanceId,
+      gymId,
+      memberId: member.id,
+      memberCode: member.memberCode,
+      memberName: member.fullName,
+      checkInDate,
+      checkInTime,
+      recordedByUid: actor.uid,
+      recordedByName: actor.displayName,
+      ...(notes?.trim() ? { notes: notes.trim().slice(0, 300) } : {}),
+      createdAt: serverTimestamp(),
+    });
+    await appendAuditLog(
+      batch,
+      actor,
+      'ATTENDANCE_CHECK_IN',
+      'AttendanceRecord',
+      attendanceId,
+      `Checked in ${member.fullName} (${member.memberCode})`,
+      gymId
+    );
+    await batch.commit();
+    return attendanceId;
+  } catch (error) {
+    handleFirestoreError(error, OperationType.CREATE, path);
+  }
+}
+
+export async function recordAttendanceCheckOut(
+  gymId: string,
+  attendanceId: string
+): Promise<void> {
+  const path = `gyms/${gymId}/attendance/${attendanceId}`;
+  try {
+    await updateDoc(doc(db, 'gyms', gymId, 'attendance', attendanceId), {
+      checkOutTime: new Date().toISOString(),
+    });
+  } catch (error) {
+    handleFirestoreError(error, OperationType.UPDATE, path);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Membership Renewal / Upgrade / Downgrade / Manual Extension / Cancellation
 // ---------------------------------------------------------------------------
 export async function assignOrRenewMembership(
   actor: ActorContext,
@@ -1304,6 +1816,9 @@ export async function assignOrRenewMembership(
   settings: GymSettings,
   options: {
     customExpiryDate?: string;
+    discountAmount?: number;
+    discountReason?: string;
+    dueDate?: string;
     amountPaidNow?: number;
     paymentMode?: PaymentMode;
     transactionReference?: string;
@@ -1350,13 +1865,14 @@ export async function assignOrRenewMembership(
         );
       }
 
-      const planPrice =
+      const grossPrice =
         actionType === MembershipActionType.MANUAL_EXTENSION ? 0 : plan.price;
+      const { discount, netPrice } = calculateNetPlanAmount(grossPrice, options.discountAmount);
       const paidNow =
         options.amountPaidNow && options.amountPaidNow > 0 && options.confirmPaymentNow
           ? options.amountPaidNow
           : 0;
-      const addedBalance = Math.max(0, Number((planPrice - paidNow).toFixed(2)));
+      const addedBalance = Math.max(0, Number((netPrice - paidNow).toFixed(2)));
       const newOutstanding = Number(
         ((currentMem.outstandingBalance || 0) + addedBalance).toFixed(2)
       );
@@ -1372,9 +1888,14 @@ export async function assignOrRenewMembership(
         actionType,
         startDate,
         expiryDate,
-        planPrice,
+        planPrice: grossPrice,
+        ...(discount > 0 ? { discountAmount: discount } : {}),
+        ...(discount > 0 && options.discountReason?.trim()
+          ? { discountReason: options.discountReason.trim().slice(0, 200) }
+          : {}),
         amountPaid: paidNow,
         balanceDue: addedBalance,
+        ...(options.dueDate ? { dueDate: options.dueDate } : {}),
         status: MembershipRecordStatus.ACTIVE,
         recordedByUid: actor.uid,
         ...(options.notes?.trim() ? { notes: options.notes.trim() } : {}),
@@ -1404,6 +1925,10 @@ export async function assignOrRenewMembership(
           memberName: currentMem.fullName,
           membershipId,
           amount: options.amountPaidNow,
+          ...(discount > 0 ? { discountAmount: discount } : {}),
+          ...(discount > 0 && options.discountReason?.trim()
+            ? { discountReason: options.discountReason.trim().slice(0, 200) }
+            : {}),
           paymentMode: options.paymentMode || PaymentMode.CASH,
           paymentPurpose:
             actionType === MembershipActionType.RENEWAL
@@ -1413,6 +1938,7 @@ export async function assignOrRenewMembership(
             ? { transactionReference: options.transactionReference.trim() }
             : {}),
           paymentDate: today,
+          ...(options.dueDate ? { dueDate: options.dueDate } : {}),
           status: options.confirmPaymentNow
             ? MemberPaymentStatus.CONFIRMED
             : MemberPaymentStatus.PENDING,
@@ -1473,6 +1999,66 @@ export async function assignOrRenewMembership(
   }
 }
 
+export async function cancelMemberMembership(
+  actor: ActorContext,
+  gymId: string,
+  member: Member,
+  activeMembership: Membership | undefined,
+  reason: string
+): Promise<void> {
+  const path = `gyms/${gymId}/members/${member.id}`;
+  const today = toIsoDate();
+  try {
+    await runTransaction(db, async (tx) => {
+      const memRef = doc(db, 'gyms', gymId, 'members', member.id);
+      const memSnap = await tx.get(memRef);
+      if (!memSnap.exists()) throw new Error('Member not found.');
+
+      if (activeMembership) {
+        const msRef = doc(db, 'gyms', gymId, 'memberships', activeMembership.id);
+        const msSnap = await tx.get(msRef);
+        if (msSnap.exists()) {
+          tx.update(msRef, {
+            status: MembershipRecordStatus.CANCELLED,
+            cancelledAt: today,
+            cancellationReason: reason.trim().slice(0, 300),
+            updatedAt: serverTimestamp(),
+          });
+        }
+      }
+
+      tx.update(memRef, {
+        membershipStatus: MembershipStatus.CANCELLED,
+        membershipExpiryDate: '',
+        updatedAt: serverTimestamp(),
+      });
+
+      const notifId = generateSecureId('gnotif');
+      tx.set(doc(db, 'gyms', gymId, 'notifications', notifId), {
+        id: notifId,
+        gymId,
+        type: 'MEMBERSHIP_CANCELLED',
+        title: 'Membership cancelled',
+        message: `${member.fullName}'s membership was cancelled (${reason.trim()}).`,
+        isRead: false,
+        createdAt: serverTimestamp(),
+      });
+
+      await appendAuditLog(
+        tx,
+        actor,
+        'CANCEL_MEMBERSHIP',
+        'Member',
+        member.id,
+        `Cancelled membership for ${member.fullName} (${member.memberCode}): ${reason}`,
+        gymId
+      );
+    });
+  } catch (error) {
+    handleFirestoreError(error, OperationType.UPDATE, path);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Member Manual Cash & UPI Payments (Idempotent Confirmation + Receipts)
 // ---------------------------------------------------------------------------
@@ -1483,6 +2069,10 @@ export async function recordMemberPayment(
   existingPayments: MemberPayment[],
   input: {
     amount: number;
+    membershipId?: string;
+    discountAmount?: number;
+    discountReason?: string;
+    dueDate?: string;
     paymentMode: PaymentMode;
     paymentPurpose: MemberPaymentPurpose;
     transactionReference?: string;
@@ -1490,6 +2080,7 @@ export async function recordMemberPayment(
     paymentDate: string;
     notes?: string;
     confirmImmediately: boolean;
+    allowDuplicateCash?: boolean;
   }
 ): Promise<string> {
   if (input.amount <= 0) {
@@ -1505,6 +2096,15 @@ export async function recordMemberPayment(
     );
   }
   if (
+    !input.allowDuplicateCash &&
+    input.paymentMode === PaymentMode.CASH &&
+    isPotentialDuplicateCashPayment(existingPayments, member.id, input.amount, input.paymentDate)
+  ) {
+    throw new Error(
+      `Duplicate payment warning: a ${input.amount} CASH entry already exists for ${member.fullName} on ${input.paymentDate}. Enable "Allow same-day duplicate cash entry" if intentional.`
+    );
+  }
+  if (
     input.confirmImmediately &&
     input.paymentMode === PaymentMode.UPI &&
     !input.transactionReference?.trim()
@@ -1512,6 +2112,20 @@ export async function recordMemberPayment(
     throw new Error(
       'Enter the verified UPI transaction reference before confirming a UPI payment.'
     );
+  }
+
+  let linkedMembershipId = input.membershipId;
+  if (!linkedMembershipId && input.paymentPurpose === MemberPaymentPurpose.BALANCE_SETTLEMENT) {
+    const msSnap = await getDocs(
+      query(
+        collection(db, 'gyms', gym.id, 'memberships'),
+        where('memberId', '==', member.id)
+      )
+    );
+    const dueMs = msSnap.docs
+      .map((d) => d.data() as Membership)
+      .find((ms) => ms.status === MembershipRecordStatus.ACTIVE && ms.balanceDue > 0);
+    if (dueMs) linkedMembershipId = dueMs.id;
   }
 
   const paymentId = generateSecureId('pay');
@@ -1525,8 +2139,18 @@ export async function recordMemberPayment(
       if (!memSnap.exists()) throw new Error('Member not found.');
       const currentMem = memSnap.data() as Member;
 
+      let msSnapData: Membership | null = null;
+      const msRef = linkedMembershipId
+        ? doc(db, 'gyms', gym.id, 'memberships', linkedMembershipId)
+        : null;
+      if (msRef) {
+        const snap = await tx.get(msRef);
+        if (snap.exists()) msSnapData = snap.data() as Membership;
+      }
+
       const receiptNumber = input.confirmImmediately ? generateHumanCode('RCP') : undefined;
       const payRef = doc(db, 'gyms', gym.id, 'member_payments', paymentId);
+      const safeDiscount = Math.max(0, Number(input.discountAmount) || 0);
 
       tx.set(payRef, {
         id: paymentId,
@@ -1534,7 +2158,12 @@ export async function recordMemberPayment(
         gymId: gym.id,
         memberId: currentMem.id,
         memberName: currentMem.fullName,
+        ...(linkedMembershipId ? { membershipId: linkedMembershipId } : {}),
         amount: input.amount,
+        ...(safeDiscount > 0 ? { discountAmount: safeDiscount } : {}),
+        ...(safeDiscount > 0 && input.discountReason?.trim()
+          ? { discountReason: input.discountReason.trim().slice(0, 200) }
+          : {}),
         paymentMode: input.paymentMode,
         paymentPurpose: input.paymentPurpose,
         ...(input.transactionReference?.trim()
@@ -1544,6 +2173,7 @@ export async function recordMemberPayment(
           ? { attachmentName: input.attachmentName.trim() }
           : {}),
         paymentDate: input.paymentDate,
+        ...(input.dueDate ? { dueDate: input.dueDate } : {}),
         status: input.confirmImmediately
           ? MemberPaymentStatus.CONFIRMED
           : MemberPaymentStatus.PENDING,
@@ -1557,15 +2187,27 @@ export async function recordMemberPayment(
       });
 
       if (input.confirmImmediately && receiptNumber) {
+        const totalSettlement = input.amount + safeDiscount;
         const nextBalance = calculateOutstandingAfterPayment(
           currentMem.outstandingBalance,
-          input.amount,
+          totalSettlement,
           input.paymentPurpose
         );
         tx.update(memRef, {
           outstandingBalance: nextBalance,
           updatedAt: serverTimestamp(),
         });
+
+        if (msRef && msSnapData) {
+          tx.update(msRef, {
+            amountPaid: Number((msSnapData.amountPaid + input.amount).toFixed(2)),
+            balanceDue: Math.max(
+              0,
+              Number((msSnapData.balanceDue - totalSettlement).toFixed(2))
+            ),
+            updatedAt: serverTimestamp(),
+          });
+        }
 
         const receiptId = generateSecureId('rcp');
         tx.set(doc(db, 'gyms', gym.id, 'payment_receipts', receiptId), {
@@ -1611,6 +2253,9 @@ export async function recordMemberPayment(
 
     return paymentId;
   } catch (error) {
+    if (error instanceof Error && (error.message.includes('Duplicate') || error.message.includes('UPI'))) {
+      throw error;
+    }
     handleFirestoreError(error, OperationType.WRITE, path);
   }
 }
@@ -1639,6 +2284,15 @@ export async function confirmPendingMemberPayment(
       if (!memSnap.exists()) throw new Error('Member not found.');
       const member = memSnap.data() as Member;
 
+      let msSnapData: Membership | null = null;
+      const msRef = payment.membershipId
+        ? doc(db, 'gyms', gym.id, 'memberships', payment.membershipId)
+        : null;
+      if (msRef) {
+        const snap = await tx.get(msRef);
+        if (snap.exists()) msSnapData = snap.data() as Membership;
+      }
+
       const receiptNumber = generateHumanCode('RCP');
       generatedReceiptNumber = receiptNumber;
 
@@ -1651,7 +2305,7 @@ export async function confirmPendingMemberPayment(
 
       const nextBalance = calculateOutstandingAfterPayment(
         member.outstandingBalance,
-        payment.amount,
+        payment.amount + (Number(payment.discountAmount) || 0),
         payment.paymentPurpose
       );
 
@@ -1659,6 +2313,23 @@ export async function confirmPendingMemberPayment(
         outstandingBalance: nextBalance,
         updatedAt: serverTimestamp(),
       });
+
+      if (msRef && msSnapData) {
+        tx.update(msRef, {
+          amountPaid: Number((msSnapData.amountPaid + payment.amount).toFixed(2)),
+          balanceDue: Math.max(
+            0,
+            Number(
+              (
+                msSnapData.balanceDue -
+                payment.amount -
+                (Number(payment.discountAmount) || 0)
+              ).toFixed(2)
+            )
+          ),
+          updatedAt: serverTimestamp(),
+        });
+      }
 
       const receiptId = generateSecureId('rcp');
       tx.set(doc(db, 'gyms', gym.id, 'payment_receipts', receiptId), {
@@ -1742,11 +2413,41 @@ export async function rejectOrRefundMemberPayment(
         throw new Error('Only confirmed payments can be refunded.');
       }
 
+      const memRef = doc(db, 'gyms', gymId, 'members', current.memberId);
+      const memSnap = await tx.get(memRef);
+      let msSnapData: Membership | null = null;
+      const msRef = current.membershipId
+        ? doc(db, 'gyms', gymId, 'memberships', current.membershipId)
+        : null;
+      if (msRef) {
+        const snap = await tx.get(msRef);
+        if (snap.exists()) msSnapData = snap.data() as Membership;
+      }
+
       tx.update(payRef, {
         status: targetStatus,
         notes: `${current.notes ? `${current.notes} | ` : ''}${targetStatus}: ${reason}`.slice(0, 500),
         updatedAt: serverTimestamp(),
       });
+
+      if (targetStatus === MemberPaymentStatus.REFUNDED) {
+        if (memSnap.exists() && current.paymentPurpose !== MemberPaymentPurpose.ADVANCE) {
+          const member = memSnap.data() as Member;
+          tx.update(memRef, {
+            outstandingBalance: Number(
+              ((member.outstandingBalance || 0) + current.amount).toFixed(2)
+            ),
+            updatedAt: serverTimestamp(),
+          });
+        }
+        if (msRef && msSnapData) {
+          tx.update(msRef, {
+            amountPaid: Math.max(0, Number((msSnapData.amountPaid - current.amount).toFixed(2))),
+            balanceDue: Number((msSnapData.balanceDue + current.amount).toFixed(2)),
+            updatedAt: serverTimestamp(),
+          });
+        }
+      }
 
       await appendAuditLog(
         tx,
@@ -1764,7 +2465,7 @@ export async function rejectOrRefundMemberPayment(
 }
 
 // ---------------------------------------------------------------------------
-// Gym Settings & Automated Reminder Engine
+// Gym Settings & Real Automated Reminder Engine
 // ---------------------------------------------------------------------------
 export async function updateGymSettings(
   actor: ActorContext,
@@ -1781,6 +2482,10 @@ export async function updateGymSettings(
       reminderDaysBefore: settings.reminderDaysBefore,
       sendOnExpiryDay: settings.sendOnExpiryDay,
       sendAfterExpiryDays: settings.sendAfterExpiryDays,
+      paymentRemindersEnabled: settings.paymentRemindersEnabled ?? true,
+      upcomingPaymentReminderDays: settings.upcomingPaymentReminderDays ?? 3,
+      overduePaymentReminderDays: settings.overduePaymentReminderDays ?? [1, 3, 7, 14],
+      ownerSubReminderDays: settings.ownerSubReminderDays ?? [7, 3, 1, 0, -3],
       emailEnabled: settings.emailEnabled,
       inAppEnabled: settings.inAppEnabled,
       whatsappEnabled: settings.whatsappEnabled,
@@ -1806,8 +2511,9 @@ export async function updateGymSettings(
         gymId,
       });
     }
+    // Note: gyme.gracePeriodDays is SaaS billing grace (Super Admin controlled);
+    // only member renewalPolicy syncs on gym doc.
     batch.update(doc(db, 'gyms', gymId), {
-      gracePeriodDays: settings.gracePeriodDays,
       renewalPolicy: settings.renewalPolicy,
       updatedAt: serverTimestamp(),
     });
@@ -1817,7 +2523,7 @@ export async function updateGymSettings(
       'UPDATE_GYM_SETTINGS',
       'GymSettings',
       gymId,
-      'Updated gym renewal policy, grace period, and reminder channels',
+      'Updated gym renewal policy, member grace period, and reminder channels',
       gymId
     );
     await batch.commit();
@@ -1831,10 +2537,14 @@ export async function runReminderBatchForGym(
   gym: Gym,
   members: Member[],
   settings: GymSettings,
-  existingLogs: NotificationLog[]
+  existingLogs: NotificationLog[],
+  memberships: Membership[] = []
 ): Promise<{ sent: number; skippedOptOut: number; failed: number }> {
   const today = toIsoDate();
-  const candidates = evaluateDueReminders(members, settings, existingLogs, today);
+  const candidates = evaluateDueReminders(members, settings, existingLogs, today, {
+    memberships,
+    gym,
+  });
   if (candidates.length === 0) {
     return { sent: 0, skippedOptOut: 0, failed: 0 };
   }
@@ -1847,29 +2557,65 @@ export async function runReminderBatchForGym(
     const batch = writeBatch(db);
     for (const c of candidates) {
       const logId = generateSecureId('nlog');
+      const attemptTime = new Date().toISOString();
       let status = DeliveryStatus.SENT;
       let errorDetails: string | undefined;
+      let providerMessageId: string | undefined;
+      let sentAt: string | undefined;
 
       if (c.skippedOptOut) {
         status = DeliveryStatus.SKIPPED_OPT_OUT;
         skippedOptOut += 1;
-      } else if (c.channel === ReminderChannel.EMAIL && !c.recipient.includes('@')) {
-        status = DeliveryStatus.RETRY_SCHEDULED;
-        errorDetails = 'Missing or invalid member email address';
-        failed += 1;
-      } else {
+      } else if (c.channel === ReminderChannel.IN_APP) {
         sent += 1;
-        if (c.channel === ReminderChannel.IN_APP) {
-          const notifId = generateSecureId('gnotif');
-          batch.set(doc(db, 'gyms', gym.id, 'notifications', notifId), {
-            id: notifId,
-            gymId: gym.id,
-            type: 'MEMBERSHIP_REMINDER',
-            title: `Reminder queued (${c.template.replace(/_/g, ' ')})`,
-            message: `${c.memberName} (${c.recipient}) scheduled for membership renewal reminder.`,
-            isRead: false,
-            createdAt: serverTimestamp(),
-          });
+        sentAt = attemptTime;
+        const notifId = generateSecureId('gnotif');
+        batch.set(doc(db, 'gyms', gym.id, 'notifications', notifId), {
+          id: notifId,
+          gymId: gym.id,
+          type: `REMINDER_${c.category}`,
+          title: c.subject.slice(0, 160),
+          message: c.message.slice(0, 500),
+          isRead: false,
+          createdAt: serverTimestamp(),
+        });
+      } else if (c.channel === ReminderChannel.EMAIL) {
+        const outcome = await dispatchExternalReminder({
+          channel: ReminderChannel.EMAIL,
+          recipient: c.recipient,
+          subject: c.subject,
+          message: c.message,
+          fromName: settings.emailFromName || gym.name,
+        });
+        if (outcome.delivered) {
+          sent += 1;
+          status = DeliveryStatus.SENT;
+          providerMessageId = outcome.providerMessageId;
+          sentAt = outcome.sentAt || attemptTime;
+        } else {
+          failed += 1;
+          status = DeliveryStatus.RETRY_SCHEDULED;
+          errorDetails = outcome.errorDetails || 'Email delivery failed';
+        }
+      } else if (c.channel === ReminderChannel.WHATSAPP_CLOUD) {
+        const outcome = await dispatchExternalReminder({
+          channel: ReminderChannel.WHATSAPP_CLOUD,
+          recipient: c.recipient,
+          subject: c.subject,
+          message: c.message,
+          whatsappPhoneNumberId: settings.whatsappPhoneNumberId,
+          whatsappApprovedTemplate: settings.whatsappApprovedTemplate,
+          whatsappTemplateParams: [c.memberName, c.template.replace(/_/g, ' ')],
+        });
+        if (outcome.delivered) {
+          sent += 1;
+          status = DeliveryStatus.SENT;
+          providerMessageId = outcome.providerMessageId;
+          sentAt = outcome.sentAt || attemptTime;
+        } else {
+          failed += 1;
+          status = DeliveryStatus.RETRY_SCHEDULED;
+          errorDetails = outcome.errorDetails || 'WhatsApp delivery failed';
         }
       }
 
@@ -1880,16 +2626,28 @@ export async function runReminderBatchForGym(
         memberName: c.memberName,
         recipient: c.recipient,
         channel: c.channel,
+        category: c.category,
         template: c.template,
         dedupKey: c.dedupKey,
         scheduledDate: c.scheduledDate,
         deliveryStatus: status,
         retryCount: 0,
-        ...(errorDetails ? { errorDetails } : {}),
+        lastAttemptAt: attemptTime,
+        ...(sentAt ? { sentAt } : {}),
+        ...(providerMessageId ? { providerMessageId } : {}),
+        ...(errorDetails ? { errorDetails: errorDetails.slice(0, 400) } : {}),
+        ...(status === DeliveryStatus.RETRY_SCHEDULED
+          ? { nextRetryAt: new Date(Date.now() + 30 * 60 * 1000).toISOString() }
+          : {}),
         createdAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
       });
     }
+
+    batch.update(doc(db, 'gyms', gym.id, 'settings', 'default'), {
+      lastReminderRunDate: today,
+      updatedAt: serverTimestamp(),
+    });
 
     await appendAuditLog(
       batch,
@@ -1897,7 +2655,7 @@ export async function runReminderBatchForGym(
       'RUN_REMINDER_ENGINE',
       'NotificationLog',
       gym.id,
-      `Processed ${candidates.length} due reminders (${sent} sent, ${skippedOptOut} opt-out, ${failed} queued for retry)`,
+      `Processed ${candidates.length} due reminders (${sent} delivered, ${skippedOptOut} opt-out, ${failed} scheduled for retry)`,
       gym.id
     );
     await batch.commit();
@@ -1908,18 +2666,61 @@ export async function runReminderBatchForGym(
 }
 
 export async function retryNotificationLog(
-  gymId: string,
+  gym: Gym,
+  settings: GymSettings,
   log: NotificationLog
-): Promise<void> {
-  const next = computeNextRetryState(log);
-  const path = `gyms/${gymId}/notification_logs/${log.id}`;
+): Promise<{ delivered: boolean; errorDetails?: string }> {
+  const path = `gyms/${gym.id}/notification_logs/${log.id}`;
+  const attemptTime = new Date().toISOString();
+
+  let delivered = false;
+  let providerMessageId: string | undefined;
+  let errorDetails: string | undefined;
+
+  if (log.channel === ReminderChannel.IN_APP) {
+    delivered = true;
+    providerMessageId = `inapp_retry_${Date.now()}`;
+  } else {
+    const subject = `${gym.name}: Reminder (${log.template.replace(/_/g, ' ')})`;
+    const message = `Hi ${log.memberName}, this is a follow-up reminder from ${gym.name} regarding ${log.template.replace(/_/g, ' ').toLowerCase()}.`;
+    const outcome = await dispatchExternalReminder({
+      channel: log.channel,
+      recipient: log.recipient,
+      subject,
+      message,
+      fromName: settings.emailFromName || gym.name,
+      whatsappPhoneNumberId: settings.whatsappPhoneNumberId,
+      whatsappApprovedTemplate: settings.whatsappApprovedTemplate,
+      whatsappTemplateParams: [log.memberName, log.template.replace(/_/g, ' ')],
+    });
+    delivered = outcome.delivered;
+    providerMessageId = outcome.providerMessageId;
+    errorDetails = outcome.errorDetails;
+  }
+
+  const next = computeNextRetryState(log, delivered, errorDetails);
+
   try {
-    await updateDoc(doc(db, 'gyms', gymId, 'notification_logs', log.id), {
+    await updateDoc(doc(db, 'gyms', gym.id, 'notification_logs', log.id), {
       deliveryStatus: next.nextStatus,
       retryCount: next.nextRetryCount,
-      errorDetails: next.canRetry ? '' : 'Maximum retries reached',
+      lastAttemptAt: attemptTime,
+      ...(delivered
+        ? {
+            errorDetails: '',
+            sentAt: attemptTime,
+            ...(providerMessageId ? { providerMessageId } : {}),
+            nextRetryAt: '',
+          }
+        : {
+            errorDetails: (next.errorDetails || 'Delivery retry failed').slice(0, 400),
+            ...(next.canRetry
+              ? { nextRetryAt: new Date(Date.now() + 30 * 60 * 1000).toISOString() }
+              : { nextRetryAt: '' }),
+          }),
       updatedAt: serverTimestamp(),
     });
+    return { delivered, errorDetails: next.errorDetails };
   } catch (error) {
     handleFirestoreError(error, OperationType.UPDATE, path);
   }
@@ -1933,5 +2734,177 @@ export async function markNotificationRead(
     await updateDoc(doc(db, collectionPath, id), { isRead: true });
   } catch (error) {
     handleFirestoreError(error, OperationType.UPDATE, `${collectionPath}/${id}`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Full Gym JSON Backup Export & Validated Restore
+// ---------------------------------------------------------------------------
+export async function exportGymBackupPayload(gym: Gym): Promise<GymBackupPayload> {
+  try {
+    const [
+      settingsSnap,
+      plansSnap,
+      membersSnap,
+      membershipsSnap,
+      paymentsSnap,
+      receiptsSnap,
+      attendanceSnap,
+      logsSnap,
+    ] = await Promise.all([
+      getDoc(doc(db, 'gyms', gym.id, 'settings', 'default')),
+      getDocs(collection(db, 'gyms', gym.id, 'membership_plans')),
+      getDocs(collection(db, 'gyms', gym.id, 'members')),
+      getDocs(collection(db, 'gyms', gym.id, 'memberships')),
+      getDocs(collection(db, 'gyms', gym.id, 'member_payments')),
+      getDocs(collection(db, 'gyms', gym.id, 'payment_receipts')),
+      getDocs(collection(db, 'gyms', gym.id, 'attendance')),
+      getDocs(collection(db, 'gyms', gym.id, 'notification_logs')),
+    ]);
+
+    return {
+      schemaVersion: 'gymos.backup.v1',
+      exportedAt: new Date().toISOString(),
+      gymId: gym.id,
+      gymName: gym.name,
+      settings: settingsSnap.exists() ? (settingsSnap.data() as GymSettings) : null,
+      membershipPlans: plansSnap.docs.map((d) => d.data() as MembershipPlan),
+      members: membersSnap.docs.map((d) => d.data() as Member),
+      memberships: membershipsSnap.docs.map((d) => d.data() as Membership),
+      memberPayments: paymentsSnap.docs.map((d) => d.data() as MemberPayment),
+      paymentReceipts: receiptsSnap.docs.map((d) => d.data() as PaymentReceipt),
+      attendance: attendanceSnap.docs.map((d) => d.data() as AttendanceRecord),
+      notificationLogs: logsSnap.docs.map((d) => d.data() as NotificationLog),
+    };
+  } catch (error) {
+    handleFirestoreError(error, OperationType.LIST, `gyms/${gym.id}`);
+  }
+}
+
+export async function restoreGymBackupPayload(
+  actor: ActorContext,
+  gym: Gym,
+  rawJsonText: string
+): Promise<{ restoredCount: number }> {
+  let parsed: GymBackupPayload;
+  try {
+    parsed = JSON.parse(rawJsonText) as GymBackupPayload;
+  } catch {
+    throw new Error('Invalid JSON file. Could not parse backup.');
+  }
+
+  if (!parsed || parsed.schemaVersion !== 'gymos.backup.v1') {
+    throw new Error('Unsupported backup format. Expected schemaVersion "gymos.backup.v1".');
+  }
+  if (parsed.gymId && parsed.gymId !== gym.id) {
+    throw new Error(
+      `Tenant mismatch: this backup belongs to gym "${parsed.gymName}" (${parsed.gymId}), not "${gym.name}" (${gym.id}).`
+    );
+  }
+  if (
+    !Array.isArray(parsed.membershipPlans) ||
+    !Array.isArray(parsed.members) ||
+    !Array.isArray(parsed.memberships) ||
+    !Array.isArray(parsed.memberPayments)
+  ) {
+    throw new Error('Malformed backup payload: missing required arrays.');
+  }
+
+  const ops: { ref: ReturnType<typeof doc>; data: Record<string, unknown> }[] = [];
+  const validIdRe = /^[a-zA-Z0-9_-]{1,128}$/;
+
+  for (const p of parsed.membershipPlans) {
+    if (!p?.id || !validIdRe.test(p.id)) continue;
+    ops.push({
+      ref: doc(db, 'gyms', gym.id, 'membership_plans', p.id),
+      data: {
+        ...p,
+        gymId: gym.id,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      },
+    });
+  }
+
+  for (const m of parsed.members) {
+    if (!m?.id || !validIdRe.test(m.id)) continue;
+    ops.push({
+      ref: doc(db, 'gyms', gym.id, 'members', m.id),
+      data: {
+        ...m,
+        gymId: gym.id,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      },
+    });
+  }
+
+  for (const ms of parsed.memberships) {
+    if (!ms?.id || !validIdRe.test(ms.id)) continue;
+    ops.push({
+      ref: doc(db, 'gyms', gym.id, 'memberships', ms.id),
+      data: {
+        ...ms,
+        gymId: gym.id,
+        recordedByUid: actor.uid,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      },
+    });
+  }
+
+  for (const pay of parsed.memberPayments) {
+    if (!pay?.id || !validIdRe.test(pay.id)) continue;
+    ops.push({
+      ref: doc(db, 'gyms', gym.id, 'member_payments', pay.id),
+      data: {
+        ...pay,
+        gymId: gym.id,
+        recordedByUid: actor.uid,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      },
+    });
+  }
+
+  if (Array.isArray(parsed.attendance)) {
+    for (const att of parsed.attendance) {
+      if (!att?.id || !validIdRe.test(att.id)) continue;
+      ops.push({
+        ref: doc(db, 'gyms', gym.id, 'attendance', att.id),
+        data: {
+          ...att,
+          gymId: gym.id,
+          recordedByUid: actor.uid,
+          createdAt: serverTimestamp(),
+        },
+      });
+    }
+  }
+
+  try {
+    const chunkSize = 400;
+    for (let i = 0; i < ops.length; i += chunkSize) {
+      const batch = writeBatch(db);
+      const chunk = ops.slice(i, i + chunkSize);
+      for (const item of chunk) {
+        batch.set(item.ref, item.data, { merge: true });
+      }
+      if (i + chunkSize >= ops.length) {
+        await appendAuditLog(
+          batch,
+          actor,
+          'RESTORE_GYM_BACKUP',
+          'Gym',
+          gym.id,
+          `Restored ${ops.length} records from backup exported ${parsed.exportedAt}`,
+          gym.id
+        );
+      }
+      await batch.commit();
+    }
+    return { restoredCount: ops.length };
+  } catch (error) {
+    handleFirestoreError(error, OperationType.WRITE, `gyms/${gym.id}`);
   }
 }

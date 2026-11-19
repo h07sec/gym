@@ -3,6 +3,7 @@ export enum UserRole {
   GYM_OWNER = 'GYM_OWNER',
   GYM_MANAGER = 'GYM_MANAGER',
   GYM_RECEPTIONIST = 'GYM_RECEPTIONIST',
+  GYM_TRAINER = 'GYM_TRAINER',
 }
 
 export enum UserStatus {
@@ -34,6 +35,7 @@ export enum PaymentMode {
 }
 
 export enum SubscriptionPaymentStatus {
+  PENDING = 'PENDING',
   RECORDED = 'RECORDED',
   VERIFIED = 'VERIFIED',
   REJECTED = 'REJECTED',
@@ -44,6 +46,14 @@ export enum MemberPaymentStatus {
   CONFIRMED = 'CONFIRMED',
   REJECTED = 'REJECTED',
   REFUNDED = 'REFUNDED',
+}
+
+export enum MemberPaymentDisplayStatus {
+  PAID = 'PAID',
+  PARTIALLY_PAID = 'PARTIALLY_PAID',
+  PENDING_VERIFICATION = 'PENDING_VERIFICATION',
+  OVERDUE = 'OVERDUE',
+  UNPAID = 'UNPAID',
 }
 
 export enum MemberPaymentPurpose {
@@ -65,6 +75,7 @@ export enum MembershipStatus {
   ACTIVE = 'ACTIVE',
   EXPIRING_SOON = 'EXPIRING_SOON',
   EXPIRED = 'EXPIRED',
+  CANCELLED = 'CANCELLED',
   NONE = 'NONE',
 }
 
@@ -89,6 +100,13 @@ export enum ReminderChannel {
   WHATSAPP_CLOUD = 'WHATSAPP_CLOUD',
 }
 
+export enum ReminderCategory {
+  MEMBERSHIP_EXPIRY = 'MEMBERSHIP_EXPIRY',
+  UPCOMING_PAYMENT = 'UPCOMING_PAYMENT',
+  OVERDUE_PAYMENT = 'OVERDUE_PAYMENT',
+  SUBSCRIPTION_EXPIRY = 'SUBSCRIPTION_EXPIRY',
+}
+
 export enum DeliveryStatus {
   SENT = 'SENT',
   FAILED = 'FAILED',
@@ -98,10 +116,13 @@ export enum DeliveryStatus {
 
 export interface StaffPermissions {
   canViewReports: boolean;
+  canViewPayments: boolean;
+  canRecordPayments: boolean;
   canManagePlans: boolean;
   canConfirmPayments: boolean;
   canDeleteMembers: boolean;
   canManageReminders: boolean;
+  canManageAttendance: boolean;
 }
 
 export interface PlatformAdmin {
@@ -163,6 +184,8 @@ export interface Gym {
   subscriptionPlanName: string;
   subscriptionStartAt: string;
   subscriptionEndAt: string;
+  subscriptionAccessUntil?: unknown;
+  ownerInvitationId?: string;
   gracePeriodDays: number;
   renewalPolicy: RenewalPolicy;
   suspensionReason?: string;
@@ -200,6 +223,11 @@ export interface GymSettings {
   reminderDaysBefore: number[];
   sendOnExpiryDay: boolean;
   sendAfterExpiryDays: number[];
+  paymentRemindersEnabled?: boolean;
+  upcomingPaymentReminderDays?: number;
+  overduePaymentReminderDays?: number[];
+  ownerSubReminderDays?: number[];
+  lastReminderRunDate?: string;
   emailEnabled: boolean;
   emailFromName?: string;
   inAppEnabled: boolean;
@@ -210,6 +238,11 @@ export interface GymSettings {
   updatedAt: unknown;
 }
 
+export type AssignableStaffRole =
+  | UserRole.GYM_MANAGER
+  | UserRole.GYM_RECEPTIONIST
+  | UserRole.GYM_TRAINER;
+
 export interface GymStaff {
   id: string;
   gymId: string;
@@ -218,7 +251,8 @@ export interface GymStaff {
   email: string;
   fullName: string;
   phone?: string;
-  role: UserRole.GYM_OWNER | UserRole.GYM_MANAGER | UserRole.GYM_RECEPTIONIST;
+  role: UserRole.GYM_OWNER | AssignableStaffRole;
+  roleTitle?: string;
   status: UserStatus;
   permissions: StaffPermissions;
   createdAt: unknown;
@@ -231,7 +265,8 @@ export interface StaffInvitation {
   gymName: string;
   email: string;
   fullName: string;
-  role: UserRole.GYM_MANAGER | UserRole.GYM_RECEPTIONIST;
+  role: UserRole.GYM_OWNER | AssignableStaffRole;
+  roleTitle?: string;
   permissions: StaffPermissions;
   status: 'PENDING' | 'ACCEPTED' | 'REVOKED';
   invitedByUid: string;
@@ -290,10 +325,15 @@ export interface Membership {
   startDate: string;
   expiryDate: string;
   planPrice: number;
+  discountAmount?: number;
+  discountReason?: string;
   amountPaid: number;
   balanceDue: number;
+  dueDate?: string;
   status: MembershipRecordStatus;
   recordedByUid: string;
+  cancelledAt?: string;
+  cancellationReason?: string;
   notes?: string;
   createdAt: unknown;
   updatedAt: unknown;
@@ -307,11 +347,14 @@ export interface MemberPayment {
   memberName: string;
   membershipId?: string;
   amount: number;
+  discountAmount?: number;
+  discountReason?: string;
   paymentMode: PaymentMode;
   paymentPurpose: MemberPaymentPurpose;
   transactionReference?: string;
   attachmentName?: string;
   paymentDate: string;
+  dueDate?: string;
   status: MemberPaymentStatus;
   recordedByUid: string;
   recordedByName: string;
@@ -336,6 +379,21 @@ export interface PaymentReceipt {
   transactionReference?: string;
   issuedAt: unknown;
   issuedByUid: string;
+}
+
+export interface AttendanceRecord {
+  id: string;
+  gymId: string;
+  memberId: string;
+  memberCode: string;
+  memberName: string;
+  checkInDate: string;
+  checkInTime: string;
+  checkOutTime?: string;
+  recordedByUid: string;
+  recordedByName: string;
+  notes?: string;
+  createdAt: unknown;
 }
 
 export interface GymNotification {
@@ -365,12 +423,17 @@ export interface NotificationLog {
   memberName: string;
   recipient: string;
   channel: ReminderChannel;
+  category?: ReminderCategory;
   template: string;
   dedupKey: string;
   scheduledDate: string;
   deliveryStatus: DeliveryStatus;
   retryCount: number;
   errorDetails?: string;
+  providerMessageId?: string;
+  sentAt?: string;
+  lastAttemptAt?: string;
+  nextRetryAt?: string;
   createdAt: unknown;
   updatedAt: unknown;
 }
