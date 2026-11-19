@@ -1,0 +1,1023 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Global Safety Net: Default-deny all reads and writes
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // -------------------------------------------------------------------------
+    // Phase 3: Global Hardened Primitives
+    // -------------------------------------------------------------------------
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null && request.auth.token.email_verified == true;
+    }
+
+    function isBootstrapSuperAdmin() {
+      return isSignedIn() && request.auth.token.email == 'iybmickey@gmail.com';
+    }
+
+    function isSuperAdmin() {
+      return isBootstrapSuperAdmin() || (
+        isSignedIn() &&
+        exists(/databases/$(database)/documents/platform_admins/$(request.auth.uid))
+      );
+    }
+
+    function userExists() {
+      return isSignedIn() && exists(/databases/$(database)/documents/users/$(request.auth.uid));
+    }
+
+    function userData() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+
+    function isActiveUser() {
+      return userExists() && userData().status == 'ACTIVE';
+    }
+
+    function isGymStaff(gymId) {
+      return isActiveUser() && userData().gymId == gymId && (
+        userData().role == 'GYM_OWNER' ||
+        userData().role == 'GYM_MANAGER' ||
+        userData().role == 'GYM_RECEPTIONIST'
+      );
+    }
+
+    function isGymOwner(gymId) {
+      return isActiveUser() && userData().gymId == gymId && userData().role == 'GYM_OWNER';
+    }
+
+    function isGymManagerOrOwner(gymId) {
+      return isActiveUser() && userData().gymId == gymId && (
+        userData().role == 'GYM_OWNER' || userData().role == 'GYM_MANAGER'
+      );
+    }
+
+    function gymExists(gymId) {
+      return exists(/databases/$(database)/documents/gyms/$(gymId));
+    }
+
+    function isGymActive(gymId) {
+      return gymExists(gymId) &&
+        get(/databases/$(database)/documents/gyms/$(gymId)).data.accountStatus == 'ACTIVE';
+    }
+
+    function isOptString(data, key, maxLen) {
+      return !(key in data) || (data[key] is string && data[key].size() <= maxLen);
+    }
+
+    function isAcceptedInviteForUser(invitationId, gymId, role) {
+      return isValidId(invitationId) &&
+        exists(/databases/$(database)/documents/invitations/$(invitationId)) &&
+        getAfter(/databases/$(database)/documents/invitations/$(invitationId)).data.email == request.auth.token.email &&
+        getAfter(/databases/$(database)/documents/invitations/$(invitationId)).data.gymId == gymId &&
+        getAfter(/databases/$(database)/documents/invitations/$(invitationId)).data.role == role &&
+        getAfter(/databases/$(database)/documents/invitations/$(invitationId)).data.status == 'ACCEPTED' &&
+        getAfter(/databases/$(database)/documents/invitations/$(invitationId)).data.acceptedByUid == request.auth.uid;
+    }
+
+    // -------------------------------------------------------------------------
+    // Phase 2 & 4: Validation Blueprints (Anti-Update-Gap)
+    // -------------------------------------------------------------------------
+    function isValidPlatformAdmin(data) {
+      return data.keys().hasAll(['uid', 'email', 'displayName', 'createdAt']) &&
+        data.keys().hasOnly(['uid', 'email', 'displayName', 'createdAt']) &&
+        isValidId(data.uid) &&
+        data.email is string && data.email.size() >= 3 && data.email.size() <= 200 &&
+        data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 120 &&
+        data.createdAt is timestamp;
+    }
+
+    function isValidPlatformSettings(data) {
+      return data.keys().hasAll([
+          'supportEmail', 'supportPhone', 'upiId', 'upiPayeeName',
+          'paymentInstructions', 'defaultGracePeriodDays', 'allowPublicRegistration', 'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'supportEmail', 'supportPhone', 'upiId', 'upiPayeeName',
+          'paymentInstructions', 'defaultGracePeriodDays', 'allowPublicRegistration', 'updatedAt'
+        ]) &&
+        data.supportEmail is string && data.supportEmail.size() >= 3 && data.supportEmail.size() <= 200 &&
+        data.supportPhone is string && data.supportPhone.size() >= 3 && data.supportPhone.size() <= 40 &&
+        data.upiId is string && data.upiId.size() <= 120 &&
+        data.upiPayeeName is string && data.upiPayeeName.size() <= 120 &&
+        data.paymentInstructions is string && data.paymentInstructions.size() <= 1000 &&
+        data.defaultGracePeriodDays is int && data.defaultGracePeriodDays >= 0 && data.defaultGracePeriodDays <= 90 &&
+        data.allowPublicRegistration is bool &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidSubscriptionPlan(data) {
+      return data.keys().hasAll([
+          'id', 'name', 'billingDurationMonths', 'price', 'currency',
+          'maxStaff', 'maxMembers', 'trialDays', 'features', 'isActive', 'createdAt', 'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'id', 'name', 'billingDurationMonths', 'price', 'currency',
+          'maxStaff', 'maxMembers', 'trialDays', 'features', 'isActive', 'createdAt', 'updatedAt'
+        ]) &&
+        isValidId(data.id) &&
+        data.name is string && data.name.size() >= 2 && data.name.size() <= 80 &&
+        data.billingDurationMonths is int && data.billingDurationMonths >= 1 && data.billingDurationMonths <= 60 &&
+        data.price is number && data.price >= 0 && data.price <= 10000000 &&
+        data.currency is string && data.currency.size() >= 1 && data.currency.size() <= 8 &&
+        data.maxStaff is int && data.maxStaff >= 1 && data.maxStaff <= 1000 &&
+        data.maxMembers is int && data.maxMembers >= 1 && data.maxMembers <= 100000 &&
+        data.trialDays is int && data.trialDays >= 0 && data.trialDays <= 90 &&
+        data.features is list && data.features.size() <= 12 &&
+        (data.features.size() == 0 || (data.features[0] is string && data.features[0].size() <= 120)) &&
+        data.isActive is bool &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidUserProfile(data) {
+      return data.keys().hasAll(['uid', 'email', 'displayName', 'role', 'status', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly(['uid', 'email', 'displayName', 'role', 'gymId', 'invitationId', 'status', 'createdAt', 'updatedAt']) &&
+        isValidId(data.uid) &&
+        data.email is string && data.email.size() >= 3 && data.email.size() <= 200 &&
+        data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 120 &&
+        data.role in ['SUPER_ADMIN', 'GYM_OWNER', 'GYM_MANAGER', 'GYM_RECEPTIONIST'] &&
+        isOptString(data, 'gymId', 128) &&
+        isOptString(data, 'invitationId', 128) &&
+        data.status in ['ACTIVE', 'DEACTIVATED'] &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidGym(data) {
+      return data.keys().hasAll([
+          'id', 'name', 'ownerUid', 'ownerName', 'email', 'phone',
+          'accountStatus', 'subscriptionStatus', 'subscriptionPlanId', 'subscriptionPlanName',
+          'subscriptionStartAt', 'subscriptionEndAt', 'gracePeriodDays', 'renewalPolicy',
+          'createdAt', 'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'id', 'name', 'ownerUid', 'ownerName', 'email', 'phone', 'address',
+          'accountStatus', 'subscriptionStatus', 'subscriptionPlanId', 'subscriptionPlanName',
+          'subscriptionStartAt', 'subscriptionEndAt', 'gracePeriodDays', 'renewalPolicy',
+          'suspensionReason', 'createdAt', 'updatedAt'
+        ]) &&
+        isValidId(data.id) &&
+        data.name is string && data.name.size() >= 2 && data.name.size() <= 120 &&
+        isValidId(data.ownerUid) &&
+        data.ownerName is string && data.ownerName.size() >= 2 && data.ownerName.size() <= 120 &&
+        data.email is string && data.email.size() >= 3 && data.email.size() <= 200 &&
+        data.phone is string && data.phone.size() >= 5 && data.phone.size() <= 40 &&
+        isOptString(data, 'address', 300) &&
+        data.accountStatus in ['ACTIVE', 'SUSPENDED'] &&
+        data.subscriptionStatus in ['TRIAL', 'ACTIVE', 'EXPIRED', 'PENDING', 'CANCELLED'] &&
+        isValidId(data.subscriptionPlanId) &&
+        data.subscriptionPlanName is string && data.subscriptionPlanName.size() >= 1 && data.subscriptionPlanName.size() <= 80 &&
+        data.subscriptionStartAt is string && data.subscriptionStartAt.size() <= 40 &&
+        data.subscriptionEndAt is string && data.subscriptionEndAt.size() <= 40 &&
+        data.gracePeriodDays is int && data.gracePeriodDays >= 0 && data.gracePeriodDays <= 90 &&
+        data.renewalPolicy in ['EXTEND_FROM_EXPIRY', 'START_TODAY_IF_EXPIRED'] &&
+        isOptString(data, 'suspensionReason', 400) &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidSubscriptionPayment(data) {
+      return data.keys().hasAll([
+          'id', 'gymId', 'gymName', 'ownerUid', 'planId', 'planName', 'amount', 'paymentMode',
+          'idempotencyKey', 'paymentDate', 'periodStart', 'periodEnd', 'status',
+          'recordedByUid', 'extensionApplied', 'createdAt', 'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'id', 'gymId', 'gymName', 'ownerUid', 'planId', 'planName', 'amount', 'paymentMode',
+          'transactionReference', 'idempotencyKey', 'paymentDate', 'periodStart', 'periodEnd',
+          'status', 'notes', 'recordedByUid', 'verifiedByUid', 'extensionApplied', 'createdAt', 'updatedAt'
+        ]) &&
+        isValidId(data.id) &&
+        isValidId(data.gymId) &&
+        data.gymName is string && data.gymName.size() >= 1 && data.gymName.size() <= 120 &&
+        isValidId(data.ownerUid) &&
+        isValidId(data.planId) &&
+        data.planName is string && data.planName.size() >= 1 && data.planName.size() <= 80 &&
+        data.amount is number && data.amount >= 0 && data.amount <= 10000000 &&
+        data.paymentMode in ['CASH', 'UPI'] &&
+        isOptString(data, 'transactionReference', 120) &&
+        isValidId(data.idempotencyKey) &&
+        data.paymentDate is string && data.paymentDate.size() <= 32 &&
+        data.periodStart is string && data.periodStart.size() <= 32 &&
+        data.periodEnd is string && data.periodEnd.size() <= 32 &&
+        data.status in ['RECORDED', 'VERIFIED', 'REJECTED'] &&
+        isOptString(data, 'notes', 500) &&
+        isValidId(data.recordedByUid) &&
+        isOptString(data, 'verifiedByUid', 128) &&
+        data.extensionApplied is bool &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidGymSettings(data, gymId) {
+      return data.keys().hasAll([
+          'gymId', 'gracePeriodDays', 'renewalPolicy', 'reminderDaysBefore',
+          'sendOnExpiryDay', 'sendAfterExpiryDays', 'emailEnabled', 'inAppEnabled',
+          'whatsappEnabled', 'currencySymbol', 'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'gymId', 'gracePeriodDays', 'renewalPolicy', 'reminderDaysBefore',
+          'sendOnExpiryDay', 'sendAfterExpiryDays', 'emailEnabled', 'emailFromName',
+          'inAppEnabled', 'whatsappEnabled', 'whatsappPhoneNumberId',
+          'whatsappApprovedTemplate', 'currencySymbol', 'updatedAt'
+        ]) &&
+        data.gymId == gymId &&
+        data.gracePeriodDays is int && data.gracePeriodDays >= 0 && data.gracePeriodDays <= 90 &&
+        data.renewalPolicy in ['EXTEND_FROM_EXPIRY', 'START_TODAY_IF_EXPIRED'] &&
+        data.reminderDaysBefore is list && data.reminderDaysBefore.size() <= 10 &&
+        (data.reminderDaysBefore.size() == 0 || data.reminderDaysBefore[0] is int) &&
+        data.sendOnExpiryDay is bool &&
+        data.sendAfterExpiryDays is list && data.sendAfterExpiryDays.size() <= 10 &&
+        (data.sendAfterExpiryDays.size() == 0 || data.sendAfterExpiryDays[0] is int) &&
+        data.emailEnabled is bool &&
+        isOptString(data, 'emailFromName', 120) &&
+        data.inAppEnabled is bool &&
+        data.whatsappEnabled is bool &&
+        isOptString(data, 'whatsappPhoneNumberId', 100) &&
+        isOptString(data, 'whatsappApprovedTemplate', 120) &&
+        data.currencySymbol is string && data.currencySymbol.size() >= 1 && data.currencySymbol.size() <= 8 &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidGymStaff(data, gymId) {
+      return data.keys().hasAll([
+          'id', 'gymId', 'email', 'fullName', 'role', 'status', 'permissions', 'createdAt', 'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'id', 'gymId', 'uid', 'invitationId', 'email', 'fullName', 'phone', 'role', 'status', 'permissions', 'createdAt', 'updatedAt'
+        ]) &&
+        isValidId(data.id) &&
+        data.gymId == gymId &&
+        isOptString(data, 'uid', 128) &&
+        isOptString(data, 'invitationId', 128) &&
+        data.email is string && data.email.size() >= 3 && data.email.size() <= 200 &&
+        data.fullName is string && data.fullName.size() >= 1 && data.fullName.size() <= 120 &&
+        isOptString(data, 'phone', 40) &&
+        data.role in ['GYM_OWNER', 'GYM_MANAGER', 'GYM_RECEPTIONIST'] &&
+        data.status in ['ACTIVE', 'DEACTIVATED'] &&
+        data.permissions is map &&
+        data.permissions.keys().hasOnly([
+          'canViewReports', 'canManagePlans', 'canConfirmPayments', 'canDeleteMembers', 'canManageReminders'
+        ]) &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidInvitation(data) {
+      return data.keys().hasAll([
+          'id', 'gymId', 'gymName', 'email', 'fullName', 'role', 'permissions',
+          'status', 'invitedByUid', 'createdAt', 'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'id', 'gymId', 'gymName', 'email', 'fullName', 'role', 'permissions',
+          'status', 'invitedByUid', 'acceptedByUid', 'createdAt', 'updatedAt'
+        ]) &&
+        isValidId(data.id) &&
+        isValidId(data.gymId) &&
+        data.gymName is string && data.gymName.size() >= 1 && data.gymName.size() <= 120 &&
+        data.email is string && data.email.size() >= 3 && data.email.size() <= 200 &&
+        data.fullName is string && data.fullName.size() >= 1 && data.fullName.size() <= 120 &&
+        data.role in ['GYM_MANAGER', 'GYM_RECEPTIONIST'] &&
+        data.permissions is map &&
+        data.permissions.keys().hasOnly([
+          'canViewReports', 'canManagePlans', 'canConfirmPayments', 'canDeleteMembers', 'canManageReminders'
+        ]) &&
+        data.status in ['PENDING', 'ACCEPTED', 'REVOKED'] &&
+        isValidId(data.invitedByUid) &&
+        isOptString(data, 'acceptedByUid', 128) &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidMember(data, gymId) {
+      return data.keys().hasAll([
+          'id', 'gymId', 'memberCode', 'fullName', 'phone', 'joiningDate',
+          'membershipStatus', 'outstandingBalance', 'reminderOptOut', 'isArchived', 'createdAt', 'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'id', 'gymId', 'memberCode', 'fullName', 'phone', 'email', 'gender', 'dateOfBirth',
+          'address', 'joiningDate', 'emergencyContact', 'currentPlanId', 'currentPlanName',
+          'membershipStartDate', 'membershipExpiryDate', 'membershipStatus', 'outstandingBalance',
+          'reminderOptOut', 'notes', 'isArchived', 'createdAt', 'updatedAt'
+        ]) &&
+        isValidId(data.id) &&
+        data.gymId == gymId &&
+        data.memberCode is string && data.memberCode.size() >= 2 && data.memberCode.size() <= 32 &&
+        data.fullName is string && data.fullName.size() >= 2 && data.fullName.size() <= 120 &&
+        data.phone is string && data.phone.size() >= 5 && data.phone.size() <= 30 &&
+        isOptString(data, 'email', 200) &&
+        isOptString(data, 'gender', 32) &&
+        isOptString(data, 'dateOfBirth', 20) &&
+        isOptString(data, 'address', 300) &&
+        data.joiningDate is string && data.joiningDate.size() <= 20 &&
+        isOptString(data, 'emergencyContact', 120) &&
+        isOptString(data, 'currentPlanId', 128) &&
+        isOptString(data, 'currentPlanName', 100) &&
+        isOptString(data, 'membershipStartDate', 20) &&
+        isOptString(data, 'membershipExpiryDate', 20) &&
+        data.membershipStatus in ['ACTIVE', 'EXPIRING_SOON', 'EXPIRED', 'NONE'] &&
+        data.outstandingBalance is number && data.outstandingBalance >= 0 && data.outstandingBalance <= 10000000 &&
+        data.reminderOptOut is bool &&
+        isOptString(data, 'notes', 1000) &&
+        data.isArchived is bool &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidMembershipPlan(data, gymId) {
+      return data.keys().hasAll([
+          'id', 'gymId', 'name', 'durationType', 'durationValue', 'price',
+          'benefits', 'status', 'createdAt', 'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'id', 'gymId', 'name', 'durationType', 'durationValue', 'price',
+          'description', 'benefits', 'status', 'createdAt', 'updatedAt'
+        ]) &&
+        isValidId(data.id) &&
+        data.gymId == gymId &&
+        data.name is string && data.name.size() >= 2 && data.name.size() <= 100 &&
+        data.durationType in ['MONTHLY', 'QUARTERLY', 'HALF_YEARLY', 'YEARLY', 'CUSTOM_DAYS'] &&
+        data.durationValue is int && data.durationValue >= 1 && data.durationValue <= 3650 &&
+        data.price is number && data.price >= 0 && data.price <= 10000000 &&
+        isOptString(data, 'description', 400) &&
+        data.benefits is list && data.benefits.size() <= 12 &&
+        (data.benefits.size() == 0 || (data.benefits[0] is string && data.benefits[0].size() <= 120)) &&
+        data.status in ['ACTIVE', 'INACTIVE'] &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidMembership(data, gymId) {
+      return data.keys().hasAll([
+          'id', 'gymId', 'memberId', 'memberName', 'planId', 'planName', 'actionType',
+          'startDate', 'expiryDate', 'planPrice', 'amountPaid', 'balanceDue', 'status',
+          'recordedByUid', 'createdAt', 'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'id', 'gymId', 'memberId', 'memberName', 'planId', 'planName', 'actionType',
+          'startDate', 'expiryDate', 'planPrice', 'amountPaid', 'balanceDue', 'status',
+          'recordedByUid', 'notes', 'createdAt', 'updatedAt'
+        ]) &&
+        isValidId(data.id) &&
+        data.gymId == gymId &&
+        isValidId(data.memberId) &&
+        data.memberName is string && data.memberName.size() >= 1 && data.memberName.size() <= 120 &&
+        isValidId(data.planId) &&
+        data.planName is string && data.planName.size() >= 1 && data.planName.size() <= 100 &&
+        data.actionType in ['INITIAL', 'RENEWAL', 'UPGRADE', 'DOWNGRADE', 'MANUAL_EXTENSION'] &&
+        data.startDate is string && data.startDate.size() <= 20 &&
+        data.expiryDate is string && data.expiryDate.size() <= 20 &&
+        data.planPrice is number && data.planPrice >= 0 && data.planPrice <= 10000000 &&
+        data.amountPaid is number && data.amountPaid >= 0 && data.amountPaid <= 10000000 &&
+        data.balanceDue is number && data.balanceDue >= 0 && data.balanceDue <= 10000000 &&
+        data.status in ['ACTIVE', 'EXPIRED', 'SUPERSEDED', 'CANCELLED'] &&
+        isValidId(data.recordedByUid) &&
+        isOptString(data, 'notes', 500) &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidMemberPayment(data, gymId) {
+      return data.keys().hasAll([
+          'id', 'paymentCode', 'gymId', 'memberId', 'memberName', 'amount',
+          'paymentMode', 'paymentPurpose', 'paymentDate', 'status',
+          'recordedByUid', 'recordedByName', 'createdAt', 'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'id', 'paymentCode', 'gymId', 'memberId', 'memberName', 'membershipId', 'amount',
+          'paymentMode', 'paymentPurpose', 'transactionReference', 'attachmentName',
+          'paymentDate', 'status', 'recordedByUid', 'recordedByName', 'confirmedByUid',
+          'receiptNumber', 'notes', 'createdAt', 'updatedAt'
+        ]) &&
+        isValidId(data.id) &&
+        data.paymentCode is string && data.paymentCode.size() >= 3 && data.paymentCode.size() <= 40 &&
+        data.gymId == gymId &&
+        isValidId(data.memberId) &&
+        data.memberName is string && data.memberName.size() >= 1 && data.memberName.size() <= 120 &&
+        isOptString(data, 'membershipId', 128) &&
+        data.amount is number && data.amount > 0 && data.amount <= 10000000 &&
+        data.paymentMode in ['CASH', 'UPI'] &&
+        data.paymentPurpose in ['MEMBERSHIP', 'RENEWAL', 'BALANCE_SETTLEMENT', 'ADVANCE'] &&
+        isOptString(data, 'transactionReference', 120) &&
+        isOptString(data, 'attachmentName', 160) &&
+        data.paymentDate is string && data.paymentDate.size() <= 20 &&
+        data.status in ['PENDING', 'CONFIRMED', 'REJECTED', 'REFUNDED'] &&
+        isValidId(data.recordedByUid) &&
+        data.recordedByName is string && data.recordedByName.size() >= 1 && data.recordedByName.size() <= 120 &&
+        isOptString(data, 'confirmedByUid', 128) &&
+        isOptString(data, 'receiptNumber', 48) &&
+        isOptString(data, 'notes', 500) &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidPaymentReceipt(data, gymId) {
+      return data.keys().hasAll([
+          'id', 'receiptNumber', 'gymId', 'gymName', 'paymentId', 'memberId',
+          'memberName', 'memberCode', 'amount', 'paymentMode', 'issuedAt', 'issuedByUid'
+        ]) &&
+        data.keys().hasOnly([
+          'id', 'receiptNumber', 'gymId', 'gymName', 'paymentId', 'memberId',
+          'memberName', 'memberCode', 'amount', 'paymentMode', 'transactionReference',
+          'issuedAt', 'issuedByUid'
+        ]) &&
+        isValidId(data.id) &&
+        data.receiptNumber is string && data.receiptNumber.size() >= 3 && data.receiptNumber.size() <= 48 &&
+        data.gymId == gymId &&
+        data.gymName is string && data.gymName.size() >= 1 && data.gymName.size() <= 120 &&
+        isValidId(data.paymentId) &&
+        isValidId(data.memberId) &&
+        data.memberName is string && data.memberName.size() >= 1 && data.memberName.size() <= 120 &&
+        data.memberCode is string && data.memberCode.size() >= 2 && data.memberCode.size() <= 32 &&
+        data.amount is number && data.amount > 0 && data.amount <= 10000000 &&
+        data.paymentMode in ['CASH', 'UPI'] &&
+        isOptString(data, 'transactionReference', 120) &&
+        data.issuedAt is timestamp &&
+        isValidId(data.issuedByUid);
+    }
+
+    function isValidGymNotification(data, gymId) {
+      return data.keys().hasAll(['id', 'gymId', 'type', 'title', 'message', 'isRead', 'createdAt']) &&
+        data.keys().hasOnly(['id', 'gymId', 'type', 'title', 'message', 'isRead', 'createdAt']) &&
+        isValidId(data.id) &&
+        data.gymId == gymId &&
+        data.type is string && data.type.size() >= 1 && data.type.size() <= 64 &&
+        data.title is string && data.title.size() >= 1 && data.title.size() <= 160 &&
+        data.message is string && data.message.size() >= 1 && data.message.size() <= 500 &&
+        data.isRead is bool &&
+        data.createdAt is timestamp;
+    }
+
+    function isValidPlatformNotification(data) {
+      return data.keys().hasAll(['id', 'type', 'title', 'message', 'isRead', 'createdAt']) &&
+        data.keys().hasOnly(['id', 'type', 'title', 'message', 'gymId', 'isRead', 'createdAt']) &&
+        isValidId(data.id) &&
+        data.type is string && data.type.size() >= 1 && data.type.size() <= 64 &&
+        data.title is string && data.title.size() >= 1 && data.title.size() <= 160 &&
+        data.message is string && data.message.size() >= 1 && data.message.size() <= 500 &&
+        isOptString(data, 'gymId', 128) &&
+        data.isRead is bool &&
+        data.createdAt is timestamp;
+    }
+
+    function isValidNotificationLog(data, gymId) {
+      return data.keys().hasAll([
+          'id', 'gymId', 'memberId', 'memberName', 'recipient', 'channel',
+          'template', 'dedupKey', 'scheduledDate', 'deliveryStatus', 'retryCount', 'createdAt', 'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'id', 'gymId', 'memberId', 'memberName', 'recipient', 'channel',
+          'template', 'dedupKey', 'scheduledDate', 'deliveryStatus', 'retryCount',
+          'errorDetails', 'createdAt', 'updatedAt'
+        ]) &&
+        isValidId(data.id) &&
+        data.gymId == gymId &&
+        isValidId(data.memberId) &&
+        data.memberName is string && data.memberName.size() >= 1 && data.memberName.size() <= 120 &&
+        data.recipient is string && data.recipient.size() >= 1 && data.recipient.size() <= 200 &&
+        data.channel in ['EMAIL', 'IN_APP', 'WHATSAPP_CLOUD'] &&
+        data.template is string && data.template.size() >= 1 && data.template.size() <= 80 &&
+        data.dedupKey is string && data.dedupKey.size() >= 3 && data.dedupKey.size() <= 160 &&
+        data.scheduledDate is string && data.scheduledDate.size() <= 20 &&
+        data.deliveryStatus in ['SENT', 'FAILED', 'RETRY_SCHEDULED', 'SKIPPED_OPT_OUT'] &&
+        data.retryCount is int && data.retryCount >= 0 && data.retryCount <= 10 &&
+        isOptString(data, 'errorDetails', 400) &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidAuditLog(data) {
+      return data.keys().hasAll([
+          'id', 'actorUid', 'actorEmail', 'actorRole', 'action', 'entityType', 'entityId', 'summary', 'createdAt'
+        ]) &&
+        data.keys().hasOnly([
+          'id', 'actorUid', 'actorEmail', 'actorRole', 'gymId', 'action', 'entityType', 'entityId', 'summary', 'createdAt'
+        ]) &&
+        isValidId(data.id) &&
+        isValidId(data.actorUid) &&
+        data.actorEmail is string && data.actorEmail.size() >= 3 && data.actorEmail.size() <= 200 &&
+        data.actorRole is string && data.actorRole.size() >= 2 && data.actorRole.size() <= 40 &&
+        isOptString(data, 'gymId', 128) &&
+        data.action is string && data.action.size() >= 2 && data.action.size() <= 80 &&
+        data.entityType is string && data.entityType.size() >= 2 && data.entityType.size() <= 64 &&
+        data.entityId is string && data.entityId.size() >= 1 && data.entityId.size() <= 128 &&
+        data.summary is string && data.summary.size() >= 2 && data.summary.size() <= 300 &&
+        data.createdAt is timestamp;
+    }
+
+    // -------------------------------------------------------------------------
+    // Phase 4: Collections & Master Gate Rules
+    // -------------------------------------------------------------------------
+    match /platform_admins/{uid} {
+      allow get: if isValidId(uid) && (isSuperAdmin() || (isSignedIn() && request.auth.uid == uid));
+      allow list: if isSuperAdmin();
+      allow create: if isValidId(uid) && isValidPlatformAdmin(incoming()) &&
+        incoming().createdAt == request.time &&
+        incoming().uid == uid &&
+        (isSuperAdmin() || (isBootstrapSuperAdmin() && request.auth.uid == uid));
+      allow update, delete: if false;
+    }
+
+    match /platform_settings/{settingId} {
+      allow get: if isValidId(settingId) && isSignedIn();
+      allow list: if isSuperAdmin();
+      allow create: if isValidId(settingId) && isSuperAdmin() &&
+        isValidPlatformSettings(incoming()) &&
+        incoming().updatedAt == request.time;
+      allow update: if isValidId(settingId) && isSuperAdmin() &&
+        isValidPlatformSettings(incoming()) &&
+        incoming().updatedAt == request.time &&
+        incoming().diff(existing()).affectedKeys().hasOnly([
+          'supportEmail', 'supportPhone', 'upiId', 'upiPayeeName',
+          'paymentInstructions', 'defaultGracePeriodDays', 'allowPublicRegistration', 'updatedAt'
+        ]);
+      allow delete: if false;
+    }
+
+    match /subscription_plans/{planId} {
+      allow get: if isValidId(planId) && isSignedIn();
+      allow list: if isSignedIn();
+      allow create: if isValidId(planId) && isSuperAdmin() &&
+        isValidSubscriptionPlan(incoming()) &&
+        incoming().id == planId &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+      allow update: if isValidId(planId) && isSuperAdmin() &&
+        isValidSubscriptionPlan(incoming()) &&
+        incoming().id == existing().id &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        incoming().diff(existing()).affectedKeys().hasOnly([
+          'name', 'billingDurationMonths', 'price', 'currency',
+          'maxStaff', 'maxMembers', 'trialDays', 'features', 'isActive', 'updatedAt'
+        ]);
+      allow delete: if isValidId(planId) && isSuperAdmin();
+    }
+
+    match /subscription_payments/{paymentId} {
+      allow get: if isValidId(paymentId) && (
+        isSuperAdmin() ||
+        (isSignedIn() && existing().ownerUid == request.auth.uid)
+      );
+      allow list: if isSuperAdmin() || (isSignedIn() && existing().ownerUid == request.auth.uid);
+      allow create: if isValidId(paymentId) && isSuperAdmin() &&
+        isValidSubscriptionPayment(incoming()) &&
+        incoming().id == paymentId &&
+        incoming().recordedByUid == request.auth.uid &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+      allow update: if isValidId(paymentId) && isSuperAdmin() &&
+        isValidSubscriptionPayment(incoming()) &&
+        existing().status == 'RECORDED' &&
+        incoming().id == existing().id &&
+        incoming().gymId == existing().gymId &&
+        incoming().ownerUid == existing().ownerUid &&
+        incoming().idempotencyKey == existing().idempotencyKey &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        incoming().diff(existing()).affectedKeys().hasOnly([
+          'status', 'verifiedByUid', 'extensionApplied', 'notes', 'updatedAt'
+        ]);
+      allow delete: if false;
+    }
+
+    match /users/{uid} {
+      allow get: if isValidId(uid) && (
+        isSuperAdmin() ||
+        (isSignedIn() && request.auth.uid == uid) ||
+        (isActiveUser() && existing().gymId == userData().gymId && userData().role == 'GYM_OWNER')
+      );
+      allow list: if isSuperAdmin() || (isSignedIn() && existing().uid == request.auth.uid);
+      allow create: if isValidId(uid) && isSignedIn() &&
+        isValidUserProfile(incoming()) &&
+        incoming().uid == uid &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time && (
+          isSuperAdmin() ||
+          (
+            request.auth.uid == uid &&
+            incoming().email == request.auth.token.email &&
+            incoming().status == 'ACTIVE' && (
+              (isBootstrapSuperAdmin() && incoming().role == 'SUPER_ADMIN') ||
+              (incoming().role == 'GYM_OWNER' &&
+                ('gymId' in incoming()) &&
+                isValidId(incoming().gymId) &&
+                getAfter(/databases/$(database)/documents/gyms/$(incoming().gymId)).data.ownerUid == request.auth.uid
+              ) ||
+              (incoming().role in ['GYM_MANAGER', 'GYM_RECEPTIONIST'] &&
+                ('gymId' in incoming()) &&
+                ('invitationId' in incoming()) &&
+                isAcceptedInviteForUser(incoming().invitationId, incoming().gymId, incoming().role)
+              )
+            )
+          )
+        );
+      allow update: if isValidId(uid) && isSignedIn() &&
+        isValidUserProfile(incoming()) &&
+        incoming().uid == existing().uid &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time && (
+          (isSuperAdmin() && incoming().diff(existing()).affectedKeys().hasOnly([
+            'displayName', 'status', 'role', 'gymId', 'updatedAt'
+          ])) ||
+          (request.auth.uid == uid &&
+            incoming().role == existing().role &&
+            incoming().gymId == existing().gymId &&
+            incoming().status == existing().status &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'updatedAt'])
+          ) ||
+          (isGymOwner(existing().gymId) &&
+            existing().role in ['GYM_MANAGER', 'GYM_RECEPTIONIST'] &&
+            incoming().role in ['GYM_MANAGER', 'GYM_RECEPTIONIST'] &&
+            incoming().gymId == existing().gymId &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['role', 'status', 'displayName', 'updatedAt'])
+          )
+        );
+      allow delete: if false;
+    }
+
+    match /invitations/{invitationId} {
+      allow get: if isValidId(invitationId) && (
+        isSuperAdmin() ||
+        (isSignedIn() && (existing().email == request.auth.token.email || existing().invitedByUid == request.auth.uid))
+      );
+      allow list: if isSuperAdmin() || (
+        isSignedIn() && (existing().email == request.auth.token.email || existing().invitedByUid == request.auth.uid)
+      );
+      allow create: if isValidId(invitationId) && isSignedIn() &&
+        isValidInvitation(incoming()) &&
+        incoming().id == invitationId &&
+        incoming().status == 'PENDING' &&
+        incoming().invitedByUid == request.auth.uid &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time &&
+        (isSuperAdmin() || (isGymOwner(incoming().gymId) && isGymActive(incoming().gymId)));
+      allow update: if isValidId(invitationId) && isSignedIn() &&
+        isValidInvitation(incoming()) &&
+        existing().status == 'PENDING' &&
+        incoming().id == existing().id &&
+        incoming().gymId == existing().gymId &&
+        incoming().email == existing().email &&
+        incoming().role == existing().role &&
+        incoming().permissions == existing().permissions &&
+        incoming().invitedByUid == existing().invitedByUid &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time && (
+          (request.auth.token.email == existing().email &&
+            incoming().status == 'ACCEPTED' &&
+            incoming().acceptedByUid == request.auth.uid &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['status', 'acceptedByUid', 'updatedAt'])
+          ) ||
+          ((isSuperAdmin() || isGymOwner(existing().gymId)) &&
+            incoming().status == 'REVOKED' &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['status', 'updatedAt'])
+          )
+        );
+      allow delete: if false;
+    }
+
+    match /gyms/{gymId} {
+      allow get: if isValidId(gymId) && (
+        isSuperAdmin() ||
+        (isSignedIn() && existing().ownerUid == request.auth.uid) ||
+        isGymStaff(gymId)
+      );
+      allow list: if isSuperAdmin() || (isSignedIn() && existing().ownerUid == request.auth.uid);
+      allow create: if isValidId(gymId) && isSignedIn() &&
+        isValidGym(incoming()) &&
+        incoming().id == gymId &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time && (
+          isSuperAdmin() ||
+          (
+            incoming().ownerUid == request.auth.uid &&
+            incoming().accountStatus == 'ACTIVE' &&
+            incoming().subscriptionStatus in ['TRIAL', 'PENDING']
+          )
+        );
+      allow update: if isValidId(gymId) && isSignedIn() &&
+        isValidGym(incoming()) &&
+        incoming().id == existing().id &&
+        incoming().ownerUid == existing().ownerUid &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time && (
+          (isSuperAdmin() && incoming().diff(existing()).affectedKeys().hasOnly([
+            'name', 'ownerName', 'email', 'phone', 'address',
+            'accountStatus', 'subscriptionStatus', 'subscriptionPlanId', 'subscriptionPlanName',
+            'subscriptionStartAt', 'subscriptionEndAt', 'gracePeriodDays', 'renewalPolicy',
+            'suspensionReason', 'updatedAt'
+          ])) ||
+          (isGymOwner(gymId) && isGymActive(gymId) &&
+            incoming().accountStatus == existing().accountStatus &&
+            incoming().subscriptionStatus == existing().subscriptionStatus &&
+            incoming().subscriptionPlanId == existing().subscriptionPlanId &&
+            incoming().subscriptionStartAt == existing().subscriptionStartAt &&
+            incoming().subscriptionEndAt == existing().subscriptionEndAt &&
+            incoming().diff(existing()).affectedKeys().hasOnly([
+              'name', 'phone', 'address', 'gracePeriodDays', 'renewalPolicy', 'updatedAt'
+            ])
+          )
+        );
+      allow delete: if false;
+
+      // -----------------------------------------------------------------------
+      // Tenant Subcollections (Master Gate + Suspension Lock)
+      // -----------------------------------------------------------------------
+      match /settings/{settingId} {
+        allow get: if isValidId(gymId) && isValidId(settingId) && (
+          isSuperAdmin() || (isGymStaff(gymId) && isGymActive(gymId))
+        );
+        allow list: if isSuperAdmin() || (isGymStaff(gymId) && existing().gymId == gymId && isGymActive(gymId));
+        allow create: if isValidId(gymId) && isValidId(settingId) &&
+          isValidGymSettings(incoming(), gymId) &&
+          incoming().updatedAt == request.time && (
+            isSuperAdmin() ||
+            (isSignedIn() && getAfter(/databases/$(database)/documents/gyms/$(gymId)).data.ownerUid == request.auth.uid && getAfter(/databases/$(database)/documents/gyms/$(gymId)).data.accountStatus == 'ACTIVE')
+          );
+        allow update: if isValidId(gymId) && isValidId(settingId) &&
+          isValidGymSettings(incoming(), gymId) &&
+          incoming().updatedAt == request.time &&
+          (isSuperAdmin() || (isGymOwner(gymId) && isGymActive(gymId))) &&
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'gracePeriodDays', 'renewalPolicy', 'reminderDaysBefore', 'sendOnExpiryDay',
+            'sendAfterExpiryDays', 'emailEnabled', 'emailFromName', 'inAppEnabled',
+            'whatsappEnabled', 'whatsappPhoneNumberId', 'whatsappApprovedTemplate',
+            'currencySymbol', 'updatedAt'
+          ]);
+        allow delete: if false;
+      }
+
+      match /staff/{staffId} {
+        allow get: if isValidId(gymId) && isValidId(staffId) && (
+          isSuperAdmin() || (isGymStaff(gymId) && isGymActive(gymId))
+        );
+        allow list: if isSuperAdmin() || (isGymStaff(gymId) && existing().gymId == gymId && isGymActive(gymId));
+        allow create: if isValidId(gymId) && isValidId(staffId) &&
+          isValidGymStaff(incoming(), gymId) &&
+          incoming().id == staffId &&
+          incoming().createdAt == request.time &&
+          incoming().updatedAt == request.time && (
+            isSuperAdmin() ||
+            (getAfter(/databases/$(database)/documents/gyms/$(gymId)).data.accountStatus == 'ACTIVE' && (
+              (isSignedIn() && getAfter(/databases/$(database)/documents/gyms/$(gymId)).data.ownerUid == request.auth.uid) ||
+              (isSignedIn() &&
+                incoming().uid == request.auth.uid &&
+                incoming().email == request.auth.token.email &&
+                incoming().role in ['GYM_MANAGER', 'GYM_RECEPTIONIST'] &&
+                ('invitationId' in incoming()) &&
+                isAcceptedInviteForUser(incoming().invitationId, gymId, incoming().role)
+              )
+            ))
+          );
+        allow update: if isValidId(gymId) && isValidId(staffId) &&
+          isValidGymStaff(incoming(), gymId) &&
+          incoming().id == existing().id &&
+          incoming().gymId == existing().gymId &&
+          incoming().createdAt == existing().createdAt &&
+          incoming().updatedAt == request.time &&
+          (isSuperAdmin() || (isGymOwner(gymId) && isGymActive(gymId))) &&
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'uid', 'fullName', 'phone', 'role', 'status', 'permissions', 'updatedAt'
+          ]);
+        allow delete: if false;
+      }
+
+      match /membership_plans/{planId} {
+        allow get: if isValidId(gymId) && isValidId(planId) && (
+          isSuperAdmin() || (isGymStaff(gymId) && isGymActive(gymId))
+        );
+        allow list: if isSuperAdmin() || (isGymStaff(gymId) && existing().gymId == gymId && isGymActive(gymId));
+        allow create: if isValidId(gymId) && isValidId(planId) &&
+          isValidMembershipPlan(incoming(), gymId) &&
+          incoming().id == planId &&
+          incoming().createdAt == request.time &&
+          incoming().updatedAt == request.time &&
+          (isSuperAdmin() || (isGymManagerOrOwner(gymId) && isGymActive(gymId)));
+        allow update: if isValidId(gymId) && isValidId(planId) &&
+          isValidMembershipPlan(incoming(), gymId) &&
+          incoming().id == existing().id &&
+          incoming().gymId == existing().gymId &&
+          incoming().createdAt == existing().createdAt &&
+          incoming().updatedAt == request.time &&
+          (isSuperAdmin() || (isGymManagerOrOwner(gymId) && isGymActive(gymId))) &&
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'name', 'durationType', 'durationValue', 'price', 'description', 'benefits', 'status', 'updatedAt'
+          ]);
+        allow delete: if isValidId(gymId) && isValidId(planId) &&
+          (isSuperAdmin() || (isGymOwner(gymId) && isGymActive(gymId)));
+      }
+
+      match /members/{memberId} {
+        allow get: if isValidId(gymId) && isValidId(memberId) && (
+          isSuperAdmin() || (isGymStaff(gymId) && isGymActive(gymId))
+        );
+        allow list: if isSuperAdmin() || (isGymStaff(gymId) && existing().gymId == gymId && isGymActive(gymId));
+        allow create: if isValidId(gymId) && isValidId(memberId) &&
+          isValidMember(incoming(), gymId) &&
+          incoming().id == memberId &&
+          incoming().createdAt == request.time &&
+          incoming().updatedAt == request.time &&
+          (isSuperAdmin() || (isGymStaff(gymId) && isGymActive(gymId)));
+        allow update: if isValidId(gymId) && isValidId(memberId) &&
+          isValidMember(incoming(), gymId) &&
+          incoming().id == existing().id &&
+          incoming().gymId == existing().gymId &&
+          incoming().memberCode == existing().memberCode &&
+          incoming().createdAt == existing().createdAt &&
+          incoming().updatedAt == request.time && (
+            isSuperAdmin() ||
+            (isGymStaff(gymId) && isGymActive(gymId) && incoming().diff(existing()).affectedKeys().hasOnly([
+              'fullName', 'phone', 'email', 'gender', 'dateOfBirth', 'address',
+              'emergencyContact', 'currentPlanId', 'currentPlanName',
+              'membershipStartDate', 'membershipExpiryDate', 'membershipStatus',
+              'outstandingBalance', 'reminderOptOut', 'notes', 'isArchived', 'updatedAt'
+            ]))
+          );
+        allow delete: if isValidId(gymId) && isValidId(memberId) &&
+          (isSuperAdmin() || (isGymOwner(gymId) && isGymActive(gymId)));
+      }
+
+      match /memberships/{membershipId} {
+        allow get: if isValidId(gymId) && isValidId(membershipId) && (
+          isSuperAdmin() || (isGymStaff(gymId) && isGymActive(gymId))
+        );
+        allow list: if isSuperAdmin() || (isGymStaff(gymId) && existing().gymId == gymId && isGymActive(gymId));
+        allow create: if isValidId(gymId) && isValidId(membershipId) &&
+          isValidMembership(incoming(), gymId) &&
+          incoming().id == membershipId &&
+          incoming().recordedByUid == request.auth.uid &&
+          incoming().createdAt == request.time &&
+          incoming().updatedAt == request.time &&
+          (isSuperAdmin() || (isGymStaff(gymId) && isGymActive(gymId)));
+        allow update: if isValidId(gymId) && isValidId(membershipId) &&
+          isValidMembership(incoming(), gymId) &&
+          incoming().id == existing().id &&
+          incoming().gymId == existing().gymId &&
+          incoming().memberId == existing().memberId &&
+          incoming().createdAt == existing().createdAt &&
+          incoming().updatedAt == request.time &&
+          (isSuperAdmin() || (isGymStaff(gymId) && isGymActive(gymId))) &&
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'amountPaid', 'balanceDue', 'status', 'expiryDate', 'notes', 'updatedAt'
+          ]);
+        allow delete: if false;
+      }
+
+      match /member_payments/{paymentId} {
+        allow get: if isValidId(gymId) && isValidId(paymentId) && (
+          isSuperAdmin() || (isGymStaff(gymId) && isGymActive(gymId))
+        );
+        allow list: if isSuperAdmin() || (isGymStaff(gymId) && existing().gymId == gymId && isGymActive(gymId));
+        allow create: if isValidId(gymId) && isValidId(paymentId) &&
+          isValidMemberPayment(incoming(), gymId) &&
+          incoming().id == paymentId &&
+          incoming().recordedByUid == request.auth.uid &&
+          incoming().createdAt == request.time &&
+          incoming().updatedAt == request.time &&
+          (isSuperAdmin() || (isGymStaff(gymId) && isGymActive(gymId)));
+        allow update: if isValidId(gymId) && isValidId(paymentId) &&
+          isValidMemberPayment(incoming(), gymId) &&
+          incoming().id == existing().id &&
+          incoming().gymId == existing().gymId &&
+          incoming().memberId == existing().memberId &&
+          incoming().amount == existing().amount &&
+          incoming().paymentMode == existing().paymentMode &&
+          incoming().createdAt == existing().createdAt &&
+          incoming().updatedAt == request.time && (
+            isSuperAdmin() || (
+              isGymStaff(gymId) && isGymActive(gymId) && (
+                (existing().status == 'PENDING' &&
+                  incoming().status in ['CONFIRMED', 'REJECTED'] &&
+                  incoming().diff(existing()).affectedKeys().hasOnly([
+                    'status', 'confirmedByUid', 'receiptNumber', 'notes', 'updatedAt'
+                  ])) ||
+                (existing().status == 'CONFIRMED' &&
+                  isGymManagerOrOwner(gymId) &&
+                  incoming().status == 'REFUNDED' &&
+                  incoming().diff(existing()).affectedKeys().hasOnly([
+                    'status', 'notes', 'updatedAt'
+                  ]))
+              )
+            )
+          );
+        allow delete: if false;
+      }
+
+      match /payment_receipts/{receiptId} {
+        allow get: if isValidId(gymId) && isValidId(receiptId) && (
+          isSuperAdmin() || (isGymStaff(gymId) && isGymActive(gymId))
+        );
+        allow list: if isSuperAdmin() || (isGymStaff(gymId) && existing().gymId == gymId && isGymActive(gymId));
+        allow create: if isValidId(gymId) && isValidId(receiptId) &&
+          isValidPaymentReceipt(incoming(), gymId) &&
+          incoming().id == receiptId &&
+          incoming().issuedByUid == request.auth.uid &&
+          incoming().issuedAt == request.time &&
+          (isSuperAdmin() || (isGymStaff(gymId) && isGymActive(gymId)));
+        allow update, delete: if false;
+      }
+
+      match /notifications/{notificationId} {
+        allow get: if isValidId(gymId) && isValidId(notificationId) && (
+          isSuperAdmin() || (isGymStaff(gymId) && isGymActive(gymId))
+        );
+        allow list: if isSuperAdmin() || (isGymStaff(gymId) && existing().gymId == gymId && isGymActive(gymId));
+        allow create: if isValidId(gymId) && isValidId(notificationId) &&
+          isValidGymNotification(incoming(), gymId) &&
+          incoming().id == notificationId &&
+          incoming().createdAt == request.time &&
+          (isSuperAdmin() || (isGymStaff(gymId) && isGymActive(gymId)));
+        allow update: if isValidId(gymId) && isValidId(notificationId) &&
+          isValidGymNotification(incoming(), gymId) &&
+          incoming().id == existing().id &&
+          incoming().gymId == existing().gymId &&
+          incoming().createdAt == existing().createdAt &&
+          (isSuperAdmin() || (isGymStaff(gymId) && isGymActive(gymId))) &&
+          incoming().diff(existing()).affectedKeys().hasOnly(['isRead']);
+        allow delete: if false;
+      }
+
+      match /notification_logs/{logId} {
+        allow get: if isValidId(gymId) && isValidId(logId) && (
+          isSuperAdmin() || (isGymStaff(gymId) && isGymActive(gymId))
+        );
+        allow list: if isSuperAdmin() || (isGymStaff(gymId) && existing().gymId == gymId && isGymActive(gymId));
+        allow create: if isValidId(gymId) && isValidId(logId) &&
+          isValidNotificationLog(incoming(), gymId) &&
+          incoming().id == logId &&
+          incoming().createdAt == request.time &&
+          incoming().updatedAt == request.time &&
+          (isSuperAdmin() || (isGymStaff(gymId) && isGymActive(gymId)));
+        allow update: if isValidId(gymId) && isValidId(logId) &&
+          isValidNotificationLog(incoming(), gymId) &&
+          incoming().id == existing().id &&
+          incoming().gymId == existing().gymId &&
+          incoming().dedupKey == existing().dedupKey &&
+          incoming().createdAt == existing().createdAt &&
+          incoming().updatedAt == request.time &&
+          (isSuperAdmin() || (isGymStaff(gymId) && isGymActive(gymId))) &&
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'deliveryStatus', 'retryCount', 'errorDetails', 'updatedAt'
+          ]);
+        allow delete: if false;
+      }
+    }
+
+    match /platform_notifications/{notificationId} {
+      allow get: if isValidId(notificationId) && isSuperAdmin();
+      allow list: if isSuperAdmin();
+      allow create: if isValidId(notificationId) && isSignedIn() &&
+        isValidPlatformNotification(incoming()) &&
+        incoming().id == notificationId &&
+        incoming().createdAt == request.time && (
+          isSuperAdmin() ||
+          (incoming().type == 'NEW_GYM_REGISTERED' &&
+            ('gymId' in incoming()) &&
+            isValidId(incoming().gymId) &&
+            getAfter(/databases/$(database)/documents/gyms/$(incoming().gymId)).data.ownerUid == request.auth.uid
+          )
+        );
+      allow update: if isValidId(notificationId) && isSuperAdmin() &&
+        isValidPlatformNotification(incoming()) &&
+        incoming().id == existing().id &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().diff(existing()).affectedKeys().hasOnly(['isRead']);
+      allow delete: if false;
+    }
+
+    match /audit_logs/{logId} {
+      allow get: if isValidId(logId) && (
+        isSuperAdmin() ||
+        (isSignedIn() && existing().actorUid == request.auth.uid) ||
+        (isSignedIn() && ('gymId' in existing()) && isGymOwner(existing().gymId))
+      );
+      allow list: if isSuperAdmin() || (
+        isSignedIn() && (
+          existing().actorUid == request.auth.uid ||
+          (isActiveUser() && userData().role == 'GYM_OWNER' && existing().gymId == userData().gymId)
+        )
+      );
+      allow create: if isValidId(logId) && isSignedIn() &&
+        isValidAuditLog(incoming()) &&
+        incoming().id == logId &&
+        incoming().actorUid == request.auth.uid &&
+        incoming().createdAt == request.time;
+      allow update, delete: if false;
+    }
+  }
+}

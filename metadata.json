@@ -1,0 +1,6 @@
+{
+  "name": "GymOS",
+  "description": "Multi-tenant gym management SaaS platform with role-based access control, member and membership lifecycle management, manual Cash/UPI ledger, automated reminders, and Super Admin subscription governance.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
