@@ -547,7 +547,7 @@ describe('Firestore Emulator Security Rules Integration Suite', () => {
       .authenticatedContext('trainer_1', { email: 'trainer1@gym.test', email_verified: true })
       .firestore();
 
-    // Trainer can log attendance
+    // Trainer can log and update attendance when canManageAttendance == true
     await assertSucceeds(
       setDoc(doc(trainerDb, 'gyms', 'gym_a', 'attendance', 'att_1'), {
         id: 'att_1',
@@ -559,6 +559,61 @@ describe('Firestore Emulator Security Rules Integration Suite', () => {
         checkInTime: '07:00',
         recordedByUid: 'trainer_1',
         recordedByName: 'Coach Ria',
+        createdAt: serverTimestamp(),
+      })
+    );
+    await assertSucceeds(
+      updateDoc(doc(trainerDb, 'gyms', 'gym_a', 'attendance', 'att_1'), {
+        checkOutTime: '08:15',
+        notes: 'Completed session',
+      })
+    );
+
+    // Trainer without canManageAttendance cannot create or update attendance
+    await testEnv.withSecurityRulesDisabled(async (ctx) => {
+      const db = ctx.firestore();
+      const now = Timestamp.now();
+      await setDoc(doc(db, 'users', 'trainer_noperm'), {
+        uid: 'trainer_noperm',
+        email: 'trainer_noperm@gym.test',
+        displayName: 'Coach NoPerm',
+        role: 'GYM_TRAINER',
+        gymId: 'gym_a',
+        status: 'ACTIVE',
+        createdAt: now,
+        updatedAt: now,
+      });
+      await setDoc(doc(db, 'gyms', 'gym_a', 'staff', 'trainer_noperm'), {
+        id: 'trainer_noperm',
+        gymId: 'gym_a',
+        uid: 'trainer_noperm',
+        email: 'trainer_noperm@gym.test',
+        fullName: 'Coach NoPerm',
+        role: 'GYM_TRAINER',
+        status: 'ACTIVE',
+        permissions: { ...ALL_FALSE_PERMS },
+        createdAt: now,
+        updatedAt: now,
+      });
+    });
+
+    const trainerNoPermDb = testEnv
+      .authenticatedContext('trainer_noperm', {
+        email: 'trainer_noperm@gym.test',
+        email_verified: true,
+      })
+      .firestore();
+    await assertFails(
+      setDoc(doc(trainerNoPermDb, 'gyms', 'gym_a', 'attendance', 'att_denied'), {
+        id: 'att_denied',
+        gymId: 'gym_a',
+        memberId: 'mem_a1',
+        memberCode: 'A-001',
+        memberName: 'Member Alpha',
+        checkInDate: '2025-06-10',
+        checkInTime: '07:30',
+        recordedByUid: 'trainer_noperm',
+        recordedByName: 'Coach NoPerm',
         createdAt: serverTimestamp(),
       })
     );
@@ -581,6 +636,114 @@ describe('Firestore Emulator Security Rules Integration Suite', () => {
         recordedByUid: 'trainer_1',
         recordedByName: 'Coach Ria',
         createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      })
+    );
+
+    // Authorized receptionist WITH canRecordPayments CAN record a PENDING payment within expression limits
+    await testEnv.withSecurityRulesDisabled(async (ctx) => {
+      const db = ctx.firestore();
+      const now = Timestamp.now();
+      await setDoc(doc(db, 'users', 'recep_1'), {
+        uid: 'recep_1',
+        email: 'recep1@gym.test',
+        displayName: 'Desk Priya',
+        role: 'GYM_RECEPTIONIST',
+        gymId: 'gym_a',
+        status: 'ACTIVE',
+        createdAt: now,
+        updatedAt: now,
+      });
+      await setDoc(doc(db, 'gyms', 'gym_a', 'staff', 'recep_1'), {
+        id: 'recep_1',
+        gymId: 'gym_a',
+        uid: 'recep_1',
+        email: 'recep1@gym.test',
+        fullName: 'Desk Priya',
+        role: 'GYM_RECEPTIONIST',
+        status: 'ACTIVE',
+        permissions: { ...ALL_FALSE_PERMS, canViewPayments: true, canRecordPayments: true },
+        createdAt: now,
+        updatedAt: now,
+      });
+    });
+
+    const recepDb = testEnv
+      .authenticatedContext('recep_1', { email: 'recep1@gym.test', email_verified: true })
+      .firestore();
+    await assertSucceeds(
+      setDoc(doc(recepDb, 'gyms', 'gym_a', 'member_payments', 'pay_recep'), {
+        id: 'pay_recep',
+        paymentCode: 'PAY-REC1',
+        gymId: 'gym_a',
+        memberId: 'mem_a1',
+        memberName: 'Member Alpha',
+        amount: 500,
+        paymentMode: 'CASH',
+        paymentPurpose: 'MEMBERSHIP',
+        paymentDate: '2025-06-10',
+        status: 'PENDING',
+        recordedByUid: 'recep_1',
+        recordedByName: 'Desk Priya',
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      })
+    );
+    // Receptionist without canConfirmPayments cannot create a CONFIRMED payment or confirm PENDING payments
+    await assertFails(
+      setDoc(doc(recepDb, 'gyms', 'gym_a', 'member_payments', 'pay_recep_confirmed'), {
+        id: 'pay_recep_confirmed',
+        paymentCode: 'PAY-REC2',
+        gymId: 'gym_a',
+        memberId: 'mem_a1',
+        memberName: 'Member Alpha',
+        amount: 500,
+        paymentMode: 'CASH',
+        paymentPurpose: 'MEMBERSHIP',
+        paymentDate: '2025-06-10',
+        status: 'CONFIRMED',
+        recordedByUid: 'recep_1',
+        recordedByName: 'Desk Priya',
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      })
+    );
+    await assertFails(
+      updateDoc(doc(recepDb, 'gyms', 'gym_a', 'member_payments', 'pay_recep'), {
+        status: 'CONFIRMED',
+        confirmedByUid: 'recep_1',
+        receiptNumber: 'RCP-REC1',
+        updatedAt: serverTimestamp(),
+      })
+    );
+
+    // Authorized owner CAN record and confirm a payment within expression limits
+    const ownerADb = testEnv
+      .authenticatedContext('owner_a', { email: 'ownera@gym.test', email_verified: true })
+      .firestore();
+    await assertSucceeds(
+      setDoc(doc(ownerADb, 'gyms', 'gym_a', 'member_payments', 'pay_valid'), {
+        id: 'pay_valid',
+        paymentCode: 'PAY-VAL1',
+        gymId: 'gym_a',
+        memberId: 'mem_a1',
+        memberName: 'Member Alpha',
+        amount: 500,
+        paymentMode: 'CASH',
+        paymentPurpose: 'MEMBERSHIP',
+        paymentDate: '2025-06-10',
+        status: 'PENDING',
+        recordedByUid: 'owner_a',
+        recordedByName: 'Owner Alpha',
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      })
+    );
+    await assertSucceeds(
+      updateDoc(doc(ownerADb, 'gyms', 'gym_a', 'member_payments', 'pay_valid'), {
+        status: 'CONFIRMED',
+        confirmedByUid: 'owner_a',
+        receiptNumber: 'RCP-VAL1',
         updatedAt: serverTimestamp(),
       })
     );
