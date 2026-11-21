@@ -86,16 +86,25 @@ export const GymShell: React.FC = () => {
 
   const isOwner =
     profile?.role === UserRole.GYM_OWNER || profile?.role === UserRole.SUPER_ADMIN;
-  const isManager = profile?.role === UserRole.GYM_MANAGER;
+  const canViewMembers =
+    isOwner ||
+    Boolean(effectivePermissions.canViewMembers) ||
+    Boolean(effectivePermissions.canManageMembers);
+  const canManagePlans = isOwner || Boolean(effectivePermissions.canManagePlans);
+  const canViewPlans = isOwner || canManagePlans || canViewMembers;
   const canViewPayments = profile
     ? canStaffViewPayments(profile.role, effectivePermissions)
     : false;
-  const canManageReminders =
-    isOwner || isManager || Boolean(effectivePermissions.canManageReminders);
-  const canManageAttendance =
-    isOwner || isManager || Boolean(effectivePermissions.canManageAttendance);
-  const canViewReports =
-    isOwner || isManager || Boolean(effectivePermissions.canViewReports);
+  const canManageReminders = isOwner || Boolean(effectivePermissions.canManageReminders);
+  const canManageAttendance = isOwner || Boolean(effectivePermissions.canManageAttendance);
+  const canViewReports = isOwner || Boolean(effectivePermissions.canViewReports);
+  const canViewNotifications =
+    isOwner ||
+    Boolean(effectivePermissions.canManageReminders) ||
+    Boolean(effectivePermissions.canViewReports) ||
+    Boolean(effectivePermissions.canManageMembers);
+  const canViewSettings =
+    isOwner || canManageReminders || canViewMembers || canViewReports;
 
   useEffect(() => {
     if (!gym?.id || !profile) return;
@@ -108,57 +117,87 @@ export const GymShell: React.FC = () => {
         )
       );
 
-    const unsubs = [
-      onSnapshot(
-        doc(db, 'gyms', gymId, 'settings', 'default'),
-        (snap) => {
-          if (snap.exists()) setSettings(snap.data() as GymSettings);
-        },
-        (err) => handleFirestoreError(err, OperationType.GET, `gyms/${gymId}/settings/default`)
-      ),
-      onSnapshot(
-        query(collection(db, 'gyms', gymId, 'members'), where('gymId', '==', gymId)),
-        (snap) => setMembers(sortByCreatedDesc(snap.docs.map((d) => d.data() as Member))),
-        (err) => handleFirestoreError(err, OperationType.LIST, `gyms/${gymId}/members`)
-      ),
-      onSnapshot(
-        query(collection(db, 'gyms', gymId, 'attendance'), where('gymId', '==', gymId)),
-        (snap) =>
-          setAttendance(
-            sortByCreatedDesc(snap.docs.map((d) => d.data() as AttendanceRecord))
-          ),
-        (err) => handleFirestoreError(err, OperationType.LIST, `gyms/${gymId}/attendance`)
-      ),
-      onSnapshot(
-        query(collection(db, 'gyms', gymId, 'membership_plans'), where('gymId', '==', gymId)),
-        (snap) =>
-          setPlans(
-            snap.docs
-              .map((d) => d.data() as MembershipPlan)
-              .sort((a, b) => a.price - b.price)
-          ),
-        (err) => handleFirestoreError(err, OperationType.LIST, `gyms/${gymId}/membership_plans`)
-      ),
-      onSnapshot(
-        query(collection(db, 'gyms', gymId, 'memberships'), where('gymId', '==', gymId)),
-        (snap) =>
-          setMemberships(sortByCreatedDesc(snap.docs.map((d) => d.data() as Membership))),
-        (err) => handleFirestoreError(err, OperationType.LIST, `gyms/${gymId}/memberships`)
-      ),
-      onSnapshot(
-        query(collection(db, 'gyms', gymId, 'notifications'), where('gymId', '==', gymId)),
-        (snap) =>
-          setNotifications(
-            sortByCreatedDesc(snap.docs.map((d) => d.data() as GymNotification))
-          ),
-        (err) => handleFirestoreError(err, OperationType.LIST, `gyms/${gymId}/notifications`)
-      ),
-      onSnapshot(
-        query(collection(db, 'gyms', gymId, 'staff'), where('gymId', '==', gymId)),
-        (snap) => setStaffList(sortByCreatedDesc(snap.docs.map((d) => d.data() as GymStaff))),
-        (err) => handleFirestoreError(err, OperationType.LIST, `gyms/${gymId}/staff`)
-      ),
-    ];
+    const unsubs: Array<() => void> = [];
+
+    if (canViewSettings) {
+      unsubs.push(
+        onSnapshot(
+          doc(db, 'gyms', gymId, 'settings', 'default'),
+          (snap) => {
+            if (snap.exists()) setSettings(snap.data() as GymSettings);
+          },
+          (err) => handleFirestoreError(err, OperationType.GET, `gyms/${gymId}/settings/default`)
+        )
+      );
+    } else {
+      setSettings(null);
+    }
+
+    if (canViewMembers) {
+      unsubs.push(
+        onSnapshot(
+          query(collection(db, 'gyms', gymId, 'members'), where('gymId', '==', gymId)),
+          (snap) => setMembers(sortByCreatedDesc(snap.docs.map((d) => d.data() as Member))),
+          (err) => handleFirestoreError(err, OperationType.LIST, `gyms/${gymId}/members`)
+        ),
+        onSnapshot(
+          query(collection(db, 'gyms', gymId, 'memberships'), where('gymId', '==', gymId)),
+          (snap) =>
+            setMemberships(sortByCreatedDesc(snap.docs.map((d) => d.data() as Membership))),
+          (err) => handleFirestoreError(err, OperationType.LIST, `gyms/${gymId}/memberships`)
+        )
+      );
+    } else {
+      setMembers([]);
+      setMemberships([]);
+    }
+
+    if (canManageAttendance) {
+      unsubs.push(
+        onSnapshot(
+          query(collection(db, 'gyms', gymId, 'attendance'), where('gymId', '==', gymId)),
+          (snap) =>
+            setAttendance(
+              sortByCreatedDesc(snap.docs.map((d) => d.data() as AttendanceRecord))
+            ),
+          (err) => handleFirestoreError(err, OperationType.LIST, `gyms/${gymId}/attendance`)
+        )
+      );
+    } else {
+      setAttendance([]);
+    }
+
+    if (canViewPlans) {
+      unsubs.push(
+        onSnapshot(
+          query(collection(db, 'gyms', gymId, 'membership_plans'), where('gymId', '==', gymId)),
+          (snap) =>
+            setPlans(
+              snap.docs
+                .map((d) => d.data() as MembershipPlan)
+                .sort((a, b) => a.price - b.price)
+            ),
+          (err) => handleFirestoreError(err, OperationType.LIST, `gyms/${gymId}/membership_plans`)
+        )
+      );
+    } else {
+      setPlans([]);
+    }
+
+    if (canViewNotifications) {
+      unsubs.push(
+        onSnapshot(
+          query(collection(db, 'gyms', gymId, 'notifications'), where('gymId', '==', gymId)),
+          (snap) =>
+            setNotifications(
+              sortByCreatedDesc(snap.docs.map((d) => d.data() as GymNotification))
+            ),
+          (err) => handleFirestoreError(err, OperationType.LIST, `gyms/${gymId}/notifications`)
+        )
+      );
+    } else {
+      setNotifications([]);
+    }
 
     if (canViewPayments) {
       unsubs.push(
@@ -211,6 +250,11 @@ export const GymShell: React.FC = () => {
 
       unsubs.push(
         onSnapshot(
+          query(collection(db, 'gyms', gymId, 'staff'), where('gymId', '==', gymId)),
+          (snap) => setStaffList(sortByCreatedDesc(snap.docs.map((d) => d.data() as GymStaff))),
+          (err) => handleFirestoreError(err, OperationType.LIST, `gyms/${gymId}/staff`)
+        ),
+        onSnapshot(
           invQuery,
           (snap) =>
             setInvitations(
@@ -225,10 +269,25 @@ export const GymShell: React.FC = () => {
           () => {}
         )
       );
+    } else {
+      setStaffList([]);
+      setInvitations([]);
+      setAuditLogs([]);
     }
 
     return () => unsubs.forEach((u) => u());
-  }, [gym?.id, profile, isOwner, canViewPayments, canManageReminders]);
+  }, [
+    gym?.id,
+    profile,
+    isOwner,
+    canViewSettings,
+    canViewMembers,
+    canManageAttendance,
+    canViewPlans,
+    canViewNotifications,
+    canViewPayments,
+    canManageReminders,
+  ]);
 
   if (!profile || !gym) return null;
 
@@ -260,9 +319,9 @@ export const GymShell: React.FC = () => {
 
   const navItems: { id: GymTab; label: string; icon: React.ReactNode; visible: boolean }[] = [
     { id: 'dashboard', label: 'Dashboard', icon: <LayoutDashboard className="w-4 h-4" />, visible: true },
-    { id: 'members', label: 'Members', icon: <Users className="w-4 h-4" />, visible: true },
+    { id: 'members', label: 'Members', icon: <Users className="w-4 h-4" />, visible: canViewMembers },
     { id: 'attendance', label: 'Attendance', icon: <CalendarCheck2 className="w-4 h-4" />, visible: canManageAttendance },
-    { id: 'plans', label: 'Membership Plans', icon: <Layers className="w-4 h-4" />, visible: true },
+    { id: 'plans', label: 'Membership Plans', icon: <Layers className="w-4 h-4" />, visible: canViewPlans },
     { id: 'payments', label: 'Cash & UPI Payments', icon: <CreditCard className="w-4 h-4" />, visible: canViewPayments },
     { id: 'reminders', label: 'Reminders & Alerts', icon: <BellRing className="w-4 h-4" />, visible: canManageReminders },
     { id: 'reports', label: 'Reports', icon: <BarChart3 className="w-4 h-4" />, visible: canViewReports },
@@ -271,7 +330,8 @@ export const GymShell: React.FC = () => {
   ];
 
   const visibleNav = navItems.filter((n) => n.visible);
-  const activeLabel = visibleNav.find((n) => n.id === tab)?.label || 'Dashboard';
+  const effectiveTab: GymTab = visibleNav.some((n) => n.id === tab) ? tab : 'dashboard';
+  const activeLabel = visibleNav.find((n) => n.id === effectiveTab)?.label || 'Dashboard';
 
   const daysToSubExpiry = gym.subscriptionEndAt
     ? diffDays(toIsoDate(), gym.subscriptionEndAt.slice(0, 10))
@@ -394,7 +454,7 @@ export const GymShell: React.FC = () => {
         )}
 
         <main className="flex-1 p-6 max-w-7xl w-full mx-auto">
-          {tab === 'dashboard' && (
+          {effectiveTab === 'dashboard' && (
             <GymDashboard
               role={profile.role}
               permissions={effectivePermissions}
@@ -405,7 +465,7 @@ export const GymShell: React.FC = () => {
               onNavigate={(next) => setTab(next as GymTab)}
             />
           )}
-          {tab === 'members' && (
+          {effectiveTab === 'members' && canViewMembers && (
             <MembersView
               actor={actor}
               gym={gym}
@@ -417,7 +477,7 @@ export const GymShell: React.FC = () => {
               payments={payments}
             />
           )}
-          {tab === 'attendance' && canManageAttendance && (
+          {effectiveTab === 'attendance' && canManageAttendance && (
             <AttendanceView
               actor={actor}
               gym={gym}
@@ -426,7 +486,7 @@ export const GymShell: React.FC = () => {
               attendance={attendance}
             />
           )}
-          {tab === 'plans' && (
+          {effectiveTab === 'plans' && canViewPlans && (
             <MembershipPlansView
               actor={actor}
               gymId={gym.id}
@@ -435,7 +495,7 @@ export const GymShell: React.FC = () => {
               plans={plans}
             />
           )}
-          {tab === 'payments' && canViewPayments && (
+          {effectiveTab === 'payments' && canViewPayments && (
             <PaymentsView
               actor={actor}
               gym={gym}
@@ -447,7 +507,7 @@ export const GymShell: React.FC = () => {
               receipts={receipts}
             />
           )}
-          {tab === 'reminders' && canManageReminders && (
+          {effectiveTab === 'reminders' && canManageReminders && (
             <RemindersView
               actor={actor}
               gym={gym}
@@ -459,7 +519,7 @@ export const GymShell: React.FC = () => {
               notifications={notifications}
             />
           )}
-          {tab === 'reports' && canViewReports && (
+          {effectiveTab === 'reports' && canViewReports && (
             <ReportsView
               gym={gym}
               settings={resolvedSettings}
@@ -468,7 +528,7 @@ export const GymShell: React.FC = () => {
               memberships={memberships}
             />
           )}
-          {tab === 'staff' && isOwner && (
+          {effectiveTab === 'staff' && isOwner && (
             <StaffView
               actor={actor}
               gym={gym}
@@ -477,7 +537,7 @@ export const GymShell: React.FC = () => {
               auditLogs={auditLogs}
             />
           )}
-          {tab === 'settings' && isOwner && (
+          {effectiveTab === 'settings' && isOwner && (
             <GymSettingsView
               actor={actor}
               gym={gym}

@@ -77,7 +77,7 @@ export function evaluateGymSubscriptionAccess(
     };
   }
 
-  if (effectiveAccessUntil && todayIso > effectiveAccessUntil) {
+  if (!effectiveAccessUntil || todayIso > effectiveAccessUntil) {
     return {
       isLocked: true,
       reason: 'EXPIRED',

@@ -31,6 +31,8 @@ interface StaffViewProps {
 
 const DEFAULT_PERMISSIONS_BY_ROLE: Record<AssignableStaffRole, StaffPermissions> = {
   [UserRole.GYM_MANAGER]: {
+    canViewMembers: true,
+    canManageMembers: true,
     canViewReports: true,
     canViewPayments: true,
     canRecordPayments: true,
@@ -41,6 +43,8 @@ const DEFAULT_PERMISSIONS_BY_ROLE: Record<AssignableStaffRole, StaffPermissions>
     canManageAttendance: true,
   },
   [UserRole.GYM_RECEPTIONIST]: {
+    canViewMembers: true,
+    canManageMembers: true,
     canViewReports: false,
     canViewPayments: true,
     canRecordPayments: true,
@@ -51,6 +55,8 @@ const DEFAULT_PERMISSIONS_BY_ROLE: Record<AssignableStaffRole, StaffPermissions>
     canManageAttendance: true,
   },
   [UserRole.GYM_TRAINER]: {
+    canViewMembers: true,
+    canManageMembers: false,
     canViewReports: false,
     canViewPayments: false,
     canRecordPayments: false,
@@ -63,6 +69,8 @@ const DEFAULT_PERMISSIONS_BY_ROLE: Record<AssignableStaffRole, StaffPermissions>
 };
 
 const PERMISSION_LABELS: { key: keyof StaffPermissions; label: string }[] = [
+  { key: 'canViewMembers', label: 'View gym member directory & memberships' },
+  { key: 'canManageMembers', label: 'Add, edit, archive, and renew gym members' },
   { key: 'canManageAttendance', label: 'Record member check-in & check-out attendance' },
   { key: 'canViewPayments', label: 'View member payment ledger, balances & receipts' },
   { key: 'canRecordPayments', label: 'Record manual Cash & UPI payments' },
@@ -258,6 +266,8 @@ export const StaffView: React.FC<StaffViewProps> = ({
                     {s.role === UserRole.GYM_OWNER
                       ? 'Full Owner Access'
                       : [
+                          s.permissions.canViewMembers && 'View Members',
+                          s.permissions.canManageMembers && 'Manage Members',
                           s.permissions.canManageAttendance && 'Attendance',
                           s.permissions.canViewPayments && 'View Payments',
                           s.permissions.canRecordPayments && 'Record Payments',
@@ -268,7 +278,7 @@ export const StaffView: React.FC<StaffViewProps> = ({
                           s.permissions.canDeleteMembers && 'Delete Members',
                         ]
                           .filter(Boolean)
-                          .join(', ') || 'Member Roster Only'}
+                          .join(', ') || 'No Module Permissions'}
                   </td>
                   <td className="px-4 py-3">
                     <StatusLabel status={s.status} />

@@ -55,7 +55,6 @@ export const GymDashboard: React.FC<GymDashboardProps> = ({
   const currency = settings?.currencySymbol || '₹';
   const showFinancials =
     role === UserRole.GYM_OWNER ||
-    role === UserRole.GYM_MANAGER ||
     role === UserRole.SUPER_ADMIN ||
     permissions.canViewPayments ||
     permissions.canViewReports;

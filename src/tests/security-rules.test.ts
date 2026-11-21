@@ -260,6 +260,7 @@ describe('Firestore Security Rules Structural & Multi-Tenant Verification', () =
       'incoming().subscriptionPlanId == existing().subscriptionPlanId',
       'incoming().subscriptionStartAt == existing().subscriptionStartAt',
       'incoming().subscriptionEndAt == existing().subscriptionEndAt',
+      'incoming().subscriptionAccessUntil == existing().subscriptionAccessUntil',
       'incoming().gracePeriodDays == existing().gracePeriodDays',
       "hasOnly([\n              'name', 'phone', 'address', 'renewalPolicy', 'updatedAt'\n            ])",
     ];
@@ -283,7 +284,13 @@ describe('Firestore Security Rules Structural & Multi-Tenant Verification', () =
     const isGymActiveBody = extractFunctionBody(rulesText, 'isGymActive');
     expect(isGymActiveBody).toContain("accountStatus == 'ACTIVE'");
     expect(isGymActiveBody).toContain("subscriptionStatus in ['TRIAL', 'ACTIVE']");
+    expect(isGymActiveBody).toContain("('subscriptionAccessUntil' in gym)");
+    expect(isGymActiveBody).toContain('gym.subscriptionAccessUntil is timestamp');
     expect(isGymActiveBody).toContain('subscriptionAccessUntil > request.time');
+    expect(isGymActiveBody).not.toContain("!('subscriptionAccessUntil' in gym)");
+
+    const isValidGymBody = extractFunctionBody(rulesText, 'isValidGym');
+    expect(isValidGymBody).toContain("'subscriptionAccessUntil'");
 
     const isGymStaffBody = extractFunctionBody(rulesText, 'isGymStaff');
     expect(isGymStaffBody).toContain('isActiveUser()');
@@ -317,7 +324,34 @@ describe('Firestore Security Rules Structural & Multi-Tenant Verification', () =
     }
   });
 
-  it('enforces granular staff RBAC for payments, receipts, attendance, reminders, and immutable logs', () => {
+  it('enforces granular staff RBAC with zero GYM_MANAGER bypasses and strict invitation permission locking', () => {
+    expect(rulesText).not.toContain('isGymManagerOrOwner');
+
+    const inviteCreateFn = extractFunctionBody(rulesText, 'isAcceptedInviteForUser');
+    expect(inviteCreateFn).toContain("status == 'PENDING'");
+
+    const inviteOps = getOpsFor('/invitations/{invitationId}');
+    expect(inviteOps.create).toContain("('expiresAt' in incoming())");
+    expect(inviteOps.update).toContain("existing().status == 'PENDING'");
+    expect(inviteOps.update).toContain('incoming().permissions == existing().permissions');
+
+    const staffOps = getOpsFor('/gyms/{gymId}/staff/{staffId}');
+    expect(staffOps.list).toContain('isGymOwner(gymId)');
+    expect(staffOps.get).toContain('request.auth.uid == staffId');
+    expect(staffOps.create).toContain('incoming().permissions ==');
+    expect(staffOps.create).toContain('isGymActiveAfter(gymId)');
+
+    const memberOps = getOpsFor('/gyms/{gymId}/members/{memberId}');
+    expect(memberOps.get).toContain("staffHasAny2(gymId, 'canViewMembers', 'canManageMembers')");
+    expect(memberOps.create).toContain("staffHasPerm(gymId, 'canManageMembers')");
+    expect(memberOps.update).toContain("staffHasPerm(gymId, 'canManageMembers')");
+    expect(memberOps.delete).toContain("staffHasPerm(gymId, 'canDeleteMembers')");
+
+    const planOps = getOpsFor('/gyms/{gymId}/membership_plans/{planId}');
+    expect(planOps.create).toContain("staffHasPerm(gymId, 'canManagePlans')");
+    expect(planOps.update).toContain("staffHasPerm(gymId, 'canManagePlans')");
+    expect(planOps.delete).toContain("staffHasPerm(gymId, 'canManagePlans')");
+
     const paymentOps = getOpsFor('/gyms/{gymId}/member_payments/{paymentId}');
     expect(paymentOps.get).toContain("staffHasPerm(gymId, 'canViewPayments')");
     expect(paymentOps.create).toContain("staffHasPerm(gymId, 'canRecordPayments')");
@@ -336,6 +370,7 @@ describe('Firestore Security Rules Structural & Multi-Tenant Verification', () =
     expect(receiptOps.delete).toBe('false');
 
     const attendanceOps = getOpsFor('/gyms/{gymId}/attendance/{attendanceId}');
+    expect(attendanceOps.get).toContain("staffHasPerm(gymId, 'canManageAttendance')");
     expect(attendanceOps.create).toContain("staffHasPerm(gymId, 'canManageAttendance')");
     expect(attendanceOps.update).toContain("staffHasPerm(gymId, 'canManageAttendance')");
     expect(attendanceOps.delete).toBe('false');
@@ -346,6 +381,7 @@ describe('Firestore Security Rules Structural & Multi-Tenant Verification', () =
     expect(logOps.delete).toBe('false');
 
     const auditOps = getOpsFor('/audit_logs/{logId}');
+    expect(auditOps.create).toContain('isGymStaff(incoming().gymId)');
     expect(auditOps.update).toBe('false');
     expect(auditOps.delete).toBe('false');
 

@@ -34,6 +34,8 @@ function parseEmulatorHost(): { host: string; port: number } {
 }
 
 const ALL_FALSE_PERMS = {
+  canViewMembers: false,
+  canManageMembers: false,
   canViewReports: false,
   canViewPayments: false,
   canRecordPayments: false,
@@ -42,6 +44,19 @@ const ALL_FALSE_PERMS = {
   canDeleteMembers: false,
   canManageReminders: false,
   canManageAttendance: false,
+};
+
+const ALL_TRUE_PERMS = {
+  canViewMembers: true,
+  canManageMembers: true,
+  canViewReports: true,
+  canViewPayments: true,
+  canRecordPayments: true,
+  canManagePlans: true,
+  canConfirmPayments: true,
+  canDeleteMembers: true,
+  canManageReminders: true,
+  canManageAttendance: true,
 };
 
 let testEnv: RulesTestEnvironment;
@@ -95,6 +110,21 @@ async function seedBaseEnvironment(opts?: {
       paymentInstructions: 'Manual Cash or UPI',
       defaultGracePeriodDays: 7,
       allowPublicRegistration,
+      updatedAt: now,
+    });
+
+    await setDoc(doc(db, 'subscription_plans', 'plan_monthly'), {
+      id: 'plan_monthly',
+      name: 'Monthly Standard',
+      billingDurationMonths: 1,
+      price: 1999,
+      currency: '₹',
+      maxStaff: 10,
+      maxMembers: 500,
+      trialDays: 14,
+      features: ['Members & Payments'],
+      isActive: true,
+      createdAt: now,
       updatedAt: now,
     });
 
@@ -155,16 +185,7 @@ async function seedBaseEnvironment(opts?: {
       fullName: 'Owner Alpha',
       role: 'GYM_OWNER',
       status: 'ACTIVE',
-      permissions: {
-        canViewReports: true,
-        canViewPayments: true,
-        canRecordPayments: true,
-        canManagePlans: true,
-        canConfirmPayments: true,
-        canDeleteMembers: true,
-        canManageReminders: true,
-        canManageAttendance: true,
-      },
+      permissions: { ...ALL_TRUE_PERMS },
       createdAt: now,
       updatedAt: now,
     });
@@ -394,6 +415,7 @@ describe('Firestore Emulator Security Rules Integration Suite', () => {
         subscriptionPlanName: 'Monthly Standard',
         subscriptionStartAt: '2025-06-10',
         subscriptionEndAt: '2025-06-24',
+        subscriptionAccessUntil: Timestamp.fromDate(new Date(Date.now() + 21 * 86400_000)),
         gracePeriodDays: 7,
         renewalPolicy: 'EXTEND_FROM_EXPIRY',
         createdAt: serverTimestamp(),
@@ -432,9 +454,10 @@ describe('Firestore Emulator Security Rules Integration Suite', () => {
         email: 'invitedowner@gym.test',
         fullName: 'Invited Owner',
         role: 'GYM_OWNER',
-        permissions: { ...ALL_FALSE_PERMS, canViewReports: true, canConfirmPayments: true },
+        permissions: { ...ALL_TRUE_PERMS },
         status: 'PENDING',
         invitedByUid: 'admin_1',
+        expiresAt: Timestamp.fromDate(new Date(Date.now() + 7 * 86400_000)),
         createdAt: now,
         updatedAt: now,
       });
@@ -805,6 +828,448 @@ describe('Firestore Emulator Security Rules Integration Suite', () => {
       setDoc(doc(ownerADb, 'system_locks', 'reminder_worker'), {
         id: 'reminder_worker',
         released: true,
+      })
+    );
+  });
+
+  it('Phase 1: blocks staff invitation permission escalation, self-elevation, expired/revoked/replayed invites, and wrong-email claims', async () => {
+    await seedBaseEnvironment();
+
+    await testEnv.withSecurityRulesDisabled(async (ctx) => {
+      const db = ctx.firestore();
+      const now = Timestamp.now();
+      await setDoc(doc(db, 'invitations', 'inv_staff_1'), {
+        id: 'inv_staff_1',
+        gymId: 'gym_a',
+        gymName: 'Alpha Fitness',
+        email: 'newstaff@gym.test',
+        fullName: 'New Staff',
+        role: 'GYM_RECEPTIONIST',
+        permissions: {
+          ...ALL_FALSE_PERMS,
+          canViewMembers: true,
+          canManageMembers: true,
+          canRecordPayments: true,
+        },
+        status: 'PENDING',
+        invitedByUid: 'owner_a',
+        expiresAt: Timestamp.fromDate(new Date(Date.now() + 3 * 86400_000)),
+        createdAt: now,
+        updatedAt: now,
+      });
+      await setDoc(doc(db, 'invitations', 'inv_expired'), {
+        id: 'inv_expired',
+        gymId: 'gym_a',
+        gymName: 'Alpha Fitness',
+        email: 'expiredstaff@gym.test',
+        fullName: 'Expired Staff',
+        role: 'GYM_TRAINER',
+        permissions: { ...ALL_FALSE_PERMS, canManageAttendance: true },
+        status: 'PENDING',
+        invitedByUid: 'owner_a',
+        expiresAt: Timestamp.fromDate(new Date(Date.now() - 3600_000)),
+        createdAt: now,
+        updatedAt: now,
+      });
+    });
+
+    // Wrong email cannot accept inv_staff_1
+    const wrongUserDb = testEnv
+      .authenticatedContext('wrong_uid', { email: 'attacker@gym.test', email_verified: true })
+      .firestore();
+    await assertFails(
+      updateDoc(doc(wrongUserDb, 'invitations', 'inv_staff_1'), {
+        status: 'ACCEPTED',
+        acceptedByUid: 'wrong_uid',
+        updatedAt: serverTimestamp(),
+      })
+    );
+
+    // Invited user (case-insensitive email) CANNOT escalate permissions on staff doc creation
+    const staffDb = testEnv
+      .authenticatedContext('staff_new_1', { email: 'NewStaff@gym.test', email_verified: true })
+      .firestore();
+    const badBatch = writeBatch(staffDb);
+    badBatch.update(doc(staffDb, 'invitations', 'inv_staff_1'), {
+      status: 'ACCEPTED',
+      acceptedByUid: 'staff_new_1',
+      updatedAt: serverTimestamp(),
+    });
+    badBatch.set(doc(staffDb, 'users', 'staff_new_1'), {
+      uid: 'staff_new_1',
+      email: 'newstaff@gym.test',
+      displayName: 'New Staff',
+      role: 'GYM_RECEPTIONIST',
+      gymId: 'gym_a',
+      invitationId: 'inv_staff_1',
+      status: 'ACTIVE',
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
+    badBatch.set(doc(staffDb, 'gyms', 'gym_a', 'staff', 'staff_new_1'), {
+      id: 'staff_new_1',
+      gymId: 'gym_a',
+      uid: 'staff_new_1',
+      invitationId: 'inv_staff_1',
+      email: 'newstaff@gym.test',
+      fullName: 'New Staff',
+      role: 'GYM_RECEPTIONIST',
+      status: 'ACTIVE',
+      permissions: { ...ALL_FALSE_PERMS, canViewMembers: true, canConfirmPayments: true }, // escalated!
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
+    await assertFails(badBatch.commit());
+
+    // Exact matching permissions succeed
+    const goodBatch = writeBatch(staffDb);
+    goodBatch.update(doc(staffDb, 'invitations', 'inv_staff_1'), {
+      status: 'ACCEPTED',
+      acceptedByUid: 'staff_new_1',
+      updatedAt: serverTimestamp(),
+    });
+    goodBatch.set(doc(staffDb, 'users', 'staff_new_1'), {
+      uid: 'staff_new_1',
+      email: 'newstaff@gym.test',
+      displayName: 'New Staff',
+      role: 'GYM_RECEPTIONIST',
+      gymId: 'gym_a',
+      invitationId: 'inv_staff_1',
+      status: 'ACTIVE',
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
+    goodBatch.set(doc(staffDb, 'gyms', 'gym_a', 'staff', 'staff_new_1'), {
+      id: 'staff_new_1',
+      gymId: 'gym_a',
+      uid: 'staff_new_1',
+      invitationId: 'inv_staff_1',
+      email: 'newstaff@gym.test',
+      fullName: 'New Staff',
+      role: 'GYM_RECEPTIONIST',
+      status: 'ACTIVE',
+      permissions: {
+        ...ALL_FALSE_PERMS,
+        canViewMembers: true,
+        canManageMembers: true,
+        canRecordPayments: true,
+      },
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
+    await assertSucceeds(goodBatch.commit());
+
+    // Staff cannot modify their own permissions/role/status or users/{uid} role/gymId
+    await assertFails(
+      updateDoc(doc(staffDb, 'gyms', 'gym_a', 'staff', 'staff_new_1'), {
+        permissions: { ...ALL_TRUE_PERMS },
+        updatedAt: serverTimestamp(),
+      })
+    );
+    await assertFails(
+      updateDoc(doc(staffDb, 'users', 'staff_new_1'), {
+        role: 'GYM_OWNER',
+        updatedAt: serverTimestamp(),
+      })
+    );
+
+    // Replay of already-accepted inv_staff_1 under another account is denied
+    const replayDb = testEnv
+      .authenticatedContext('replay_uid', { email: 'newstaff@gym.test', email_verified: true })
+      .firestore();
+    await assertFails(
+      setDoc(doc(replayDb, 'users', 'replay_uid'), {
+        uid: 'replay_uid',
+        email: 'newstaff@gym.test',
+        displayName: 'Replay',
+        role: 'GYM_RECEPTIONIST',
+        gymId: 'gym_a',
+        invitationId: 'inv_staff_1',
+        status: 'ACTIVE',
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      })
+    );
+
+    // Expired invitation cannot be accepted
+    const expiredStaffDb = testEnv
+      .authenticatedContext('exp_staff_1', {
+        email: 'expiredstaff@gym.test',
+        email_verified: true,
+      })
+      .firestore();
+    await assertFails(
+      updateDoc(doc(expiredStaffDb, 'invitations', 'inv_expired'), {
+        status: 'ACCEPTED',
+        acceptedByUid: 'exp_staff_1',
+        updatedAt: serverTimestamp(),
+      })
+    );
+  });
+
+  it('Phase 1: fails closed when subscriptionAccessUntil is missing and prevents forged trial expiry on self-registration', async () => {
+    await seedBaseEnvironment();
+
+    // Remove subscriptionAccessUntil from gym_a directly via admin bypass
+    await testEnv.withSecurityRulesDisabled(async (ctx) => {
+      const db = ctx.firestore();
+      await setDoc(doc(db, 'gyms', 'gym_no_ts'), {
+        id: 'gym_no_ts',
+        name: 'No Access Timestamp Gym',
+        ownerUid: 'owner_no_ts',
+        ownerName: 'No TS',
+        email: 'nots@gym.test',
+        phone: '9876543222',
+        accountStatus: 'ACTIVE',
+        subscriptionStatus: 'ACTIVE',
+        subscriptionPlanId: 'plan_monthly',
+        subscriptionPlanName: 'Monthly Standard',
+        subscriptionStartAt: '2025-06-01',
+        subscriptionEndAt: '2099-12-31',
+        gracePeriodDays: 7,
+        renewalPolicy: 'EXTEND_FROM_EXPIRY',
+        createdAt: Timestamp.now(),
+        updatedAt: Timestamp.now(),
+      });
+      await setDoc(doc(db, 'users', 'owner_no_ts'), {
+        uid: 'owner_no_ts',
+        email: 'nots@gym.test',
+        displayName: 'No TS',
+        role: 'GYM_OWNER',
+        gymId: 'gym_no_ts',
+        status: 'ACTIVE',
+        createdAt: Timestamp.now(),
+        updatedAt: Timestamp.now(),
+      });
+      await setDoc(doc(db, 'gyms', 'gym_no_ts', 'members', 'mem_nots'), {
+        id: 'mem_nots',
+        gymId: 'gym_no_ts',
+        memberCode: 'N-001',
+        fullName: 'Blocked Member',
+        phone: '9998887770',
+        joiningDate: '2025-06-01',
+        membershipStatus: 'ACTIVE',
+        outstandingBalance: 0,
+        reminderOptOut: false,
+        isArchived: false,
+        createdAt: Timestamp.now(),
+        updatedAt: Timestamp.now(),
+      });
+    });
+
+    const ownerNoTsDb = testEnv
+      .authenticatedContext('owner_no_ts', { email: 'nots@gym.test', email_verified: true })
+      .firestore();
+    // Operational subcollection access must FAIL CLOSED without subscriptionAccessUntil
+    await assertFails(getDoc(doc(ownerNoTsDb, 'gyms', 'gym_no_ts', 'members', 'mem_nots')));
+    // Expired/missing-ts owner can STILL read own gym doc and platform settings for renewal
+    await assertSucceeds(getDoc(doc(ownerNoTsDb, 'gyms', 'gym_no_ts')));
+    await assertSucceeds(getDoc(doc(ownerNoTsDb, 'platform_settings', 'default')));
+
+    // Self-registration cannot forge a 2099 trial expiry
+    const newOwnerDb = testEnv
+      .authenticatedContext('new_owner_1', { email: 'newowner@gym.test', email_verified: true })
+      .firestore();
+    await assertFails(
+      setDoc(doc(newOwnerDb, 'gyms', 'gym_forged'), {
+        id: 'gym_forged',
+        name: 'Forged Trial Gym',
+        ownerUid: 'new_owner_1',
+        ownerName: 'New Owner',
+        email: 'newowner@gym.test',
+        phone: '9876543288',
+        accountStatus: 'ACTIVE',
+        subscriptionStatus: 'TRIAL',
+        subscriptionPlanId: 'plan_monthly',
+        subscriptionPlanName: 'Monthly Standard',
+        subscriptionStartAt: '2025-06-10',
+        subscriptionEndAt: '2099-12-31',
+        subscriptionAccessUntil: Timestamp.fromDate(new Date('2099-12-31T23:59:59.000Z')),
+        gracePeriodDays: 7,
+        renewalPolicy: 'EXTEND_FROM_EXPIRY',
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      })
+    );
+    // Valid bounded trial succeeds
+    await assertSucceeds(
+      setDoc(doc(newOwnerDb, 'gyms', 'gym_valid_trial'), {
+        id: 'gym_valid_trial',
+        name: 'Valid Trial Gym',
+        ownerUid: 'new_owner_1',
+        ownerName: 'New Owner',
+        email: 'newowner@gym.test',
+        phone: '9876543288',
+        accountStatus: 'ACTIVE',
+        subscriptionStatus: 'TRIAL',
+        subscriptionPlanId: 'plan_monthly',
+        subscriptionPlanName: 'Monthly Standard',
+        subscriptionStartAt: '2025-06-10',
+        subscriptionEndAt: '2025-06-24',
+        subscriptionAccessUntil: Timestamp.fromDate(new Date(Date.now() + 21 * 86400_000)),
+        gracePeriodDays: 7,
+        renewalPolicy: 'EXTEND_FROM_EXPIRY',
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      })
+    );
+  });
+
+  it('Phase 2: removes GYM_MANAGER bypasses and enforces explicit permissions & staff list isolation', async () => {
+    await seedBaseEnvironment();
+
+    await testEnv.withSecurityRulesDisabled(async (ctx) => {
+      const db = ctx.firestore();
+      const now = Timestamp.now();
+
+      await setDoc(doc(db, 'gyms', 'gym_a', 'settings', 'default'), {
+        gymId: 'gym_a',
+        gracePeriodDays: 7,
+        renewalPolicy: 'EXTEND_FROM_EXPIRY',
+        reminderDaysBefore: [7, 3],
+        sendOnExpiryDay: true,
+        sendAfterExpiryDays: [3],
+        emailEnabled: true,
+        inAppEnabled: true,
+        whatsappEnabled: false,
+        whatsappPhoneNumberId: 'wa_owner_only',
+        currencySymbol: '₹',
+        updatedAt: now,
+      });
+
+      await setDoc(doc(db, 'gyms', 'gym_a', 'membership_plans', 'plan_a1'), {
+        id: 'plan_a1',
+        gymId: 'gym_a',
+        name: 'Gold Monthly',
+        durationType: 'MONTHLY',
+        durationValue: 1,
+        price: 1500,
+        benefits: ['Gym floor'],
+        status: 'ACTIVE',
+        createdAt: now,
+        updatedAt: now,
+      });
+
+      // Manager with ALL_FALSE_PERMS must be denied restricted modules
+      await setDoc(doc(db, 'users', 'mgr_noperm'), {
+        uid: 'mgr_noperm',
+        email: 'mgr.noperm@gym.test',
+        displayName: 'Mgr NoPerm',
+        role: 'GYM_MANAGER',
+        gymId: 'gym_a',
+        status: 'ACTIVE',
+        createdAt: now,
+        updatedAt: now,
+      });
+      await setDoc(doc(db, 'gyms', 'gym_a', 'staff', 'mgr_noperm'), {
+        id: 'mgr_noperm',
+        gymId: 'gym_a',
+        uid: 'mgr_noperm',
+        email: 'mgr.noperm@gym.test',
+        fullName: 'Mgr NoPerm',
+        role: 'GYM_MANAGER',
+        status: 'ACTIVE',
+        permissions: { ...ALL_FALSE_PERMS },
+        createdAt: now,
+        updatedAt: now,
+      });
+
+      // Manager with explicit permissions succeeds on those modules only
+      await setDoc(doc(db, 'users', 'mgr_rem'), {
+        uid: 'mgr_rem',
+        email: 'mgr.rem@gym.test',
+        displayName: 'Mgr Reminders',
+        role: 'GYM_MANAGER',
+        gymId: 'gym_a',
+        status: 'ACTIVE',
+        createdAt: now,
+        updatedAt: now,
+      });
+      await setDoc(doc(db, 'gyms', 'gym_a', 'staff', 'mgr_rem'), {
+        id: 'mgr_rem',
+        gymId: 'gym_a',
+        uid: 'mgr_rem',
+        email: 'mgr.rem@gym.test',
+        fullName: 'Mgr Reminders',
+        role: 'GYM_MANAGER',
+        status: 'ACTIVE',
+        permissions: { ...ALL_FALSE_PERMS, canManageReminders: true, canViewMembers: true },
+        createdAt: now,
+        updatedAt: now,
+      });
+
+      // Trainer with ONLY canManageAttendance
+      await setDoc(doc(db, 'users', 'trainer_att'), {
+        uid: 'trainer_att',
+        email: 'trainer.att@gym.test',
+        displayName: 'Coach Att',
+        role: 'GYM_TRAINER',
+        gymId: 'gym_a',
+        status: 'ACTIVE',
+        createdAt: now,
+        updatedAt: now,
+      });
+      await setDoc(doc(db, 'gyms', 'gym_a', 'staff', 'trainer_att'), {
+        id: 'trainer_att',
+        gymId: 'gym_a',
+        uid: 'trainer_att',
+        email: 'trainer.att@gym.test',
+        fullName: 'Coach Att',
+        role: 'GYM_TRAINER',
+        status: 'ACTIVE',
+        permissions: { ...ALL_FALSE_PERMS, canManageAttendance: true },
+        createdAt: now,
+        updatedAt: now,
+      });
+    });
+
+    const mgrNoPermDb = testEnv
+      .authenticatedContext('mgr_noperm', { email: 'mgr.noperm@gym.test', email_verified: true })
+      .firestore();
+    await assertFails(getDoc(doc(mgrNoPermDb, 'gyms', 'gym_a', 'members', 'mem_a1')));
+    await assertFails(getDoc(doc(mgrNoPermDb, 'gyms', 'gym_a', 'member_payments', 'pay_a1')));
+    await assertFails(getDoc(doc(mgrNoPermDb, 'gyms', 'gym_a', 'membership_plans', 'plan_a1')));
+    await assertFails(getDoc(doc(mgrNoPermDb, 'gyms', 'gym_a', 'settings', 'default')));
+    await assertFails(getDoc(doc(mgrNoPermDb, 'gyms', 'gym_a', 'staff', 'owner_a')));
+    // Self staff doc read succeeds
+    await assertSucceeds(getDoc(doc(mgrNoPermDb, 'gyms', 'gym_a', 'staff', 'mgr_noperm')));
+
+    // Manager with canManageReminders CAN update reminder schedule, CANNOT alter WhatsApp Phone Number ID
+    const mgrRemDb = testEnv
+      .authenticatedContext('mgr_rem', { email: 'mgr.rem@gym.test', email_verified: true })
+      .firestore();
+    await assertSucceeds(
+      updateDoc(doc(mgrRemDb, 'gyms', 'gym_a', 'settings', 'default'), {
+        reminderDaysBefore: [5, 2],
+        updatedAt: serverTimestamp(),
+      })
+    );
+    await assertFails(
+      updateDoc(doc(mgrRemDb, 'gyms', 'gym_a', 'settings', 'default'), {
+        whatsappPhoneNumberId: 'tampered_wa_id',
+        updatedAt: serverTimestamp(),
+      })
+    );
+
+    // Trainer with ONLY canManageAttendance cannot read members, plans, or coworkers
+    const trainerAttDb = testEnv
+      .authenticatedContext('trainer_att', { email: 'trainer.att@gym.test', email_verified: true })
+      .firestore();
+    await assertFails(getDoc(doc(trainerAttDb, 'gyms', 'gym_a', 'members', 'mem_a1')));
+    await assertFails(getDoc(doc(trainerAttDb, 'gyms', 'gym_a', 'membership_plans', 'plan_a1')));
+    await assertFails(getDoc(doc(trainerAttDb, 'gyms', 'gym_a', 'staff', 'mgr_rem')));
+    await assertSucceeds(
+      setDoc(doc(trainerAttDb, 'gyms', 'gym_a', 'attendance', 'att_phase2'), {
+        id: 'att_phase2',
+        gymId: 'gym_a',
+        memberId: 'mem_a1',
+        memberCode: 'A-001',
+        memberName: 'Member Alpha',
+        checkInDate: '2025-06-11',
+        checkInTime: '06:30',
+        recordedByUid: 'trainer_att',
+        recordedByName: 'Coach Att',
+        createdAt: serverTimestamp(),
       })
     );
   });

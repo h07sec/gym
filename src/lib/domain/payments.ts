@@ -84,35 +84,23 @@ export function canStaffConfirmPayment(
   permissions?: StaffPermissions | null
 ): boolean {
   if (role === UserRole.SUPER_ADMIN || role === UserRole.GYM_OWNER) return true;
-  if (role === UserRole.GYM_MANAGER) return permissions?.canConfirmPayments ?? true;
-  if (role === UserRole.GYM_RECEPTIONIST) return permissions?.canConfirmPayments ?? false;
-  return false;
+  return Boolean(permissions?.canConfirmPayments);
 }
 
 export function canStaffRecordPayment(
   role: UserRole,
   permissions?: StaffPermissions | null
 ): boolean {
-  if (role === UserRole.SUPER_ADMIN || role === UserRole.GYM_OWNER || role === UserRole.GYM_MANAGER) {
-    return true;
-  }
-  if (role === UserRole.GYM_RECEPTIONIST) return permissions?.canRecordPayments ?? true;
-  return permissions?.canRecordPayments ?? false;
+  if (role === UserRole.SUPER_ADMIN || role === UserRole.GYM_OWNER) return true;
+  return Boolean(permissions?.canRecordPayments);
 }
 
 export function canStaffViewPayments(
   role: UserRole,
   permissions?: StaffPermissions | null
 ): boolean {
-  if (role === UserRole.SUPER_ADMIN || role === UserRole.GYM_OWNER || role === UserRole.GYM_MANAGER) {
-    return true;
-  }
-  if (role === UserRole.GYM_RECEPTIONIST) {
-    return (permissions?.canViewPayments ?? true) || (permissions?.canRecordPayments ?? false);
-  }
-  return Boolean(
-    permissions?.canViewPayments || permissions?.canRecordPayments || permissions?.canConfirmPayments
-  );
+  if (role === UserRole.SUPER_ADMIN || role === UserRole.GYM_OWNER) return true;
+  return Boolean(permissions?.canViewPayments);
 }
 
 export function isDuplicateUpiReference(

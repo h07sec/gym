@@ -179,7 +179,7 @@ function evaluateGymSubscriptionAccess(gym, todayIso) {
       inGracePeriod: false
     };
   }
-  if (effectiveAccessUntil && todayIso > effectiveAccessUntil) {
+  if (!effectiveAccessUntil || todayIso > effectiveAccessUntil) {
     return {
       isLocked: true,
       reason: "EXPIRED",
@@ -370,7 +370,7 @@ async function authorizeAndResolveNotificationDispatch(params) {
       if (staffSnap.exists) {
         const staff = staffSnap.data() || {};
         const perms = staff.permissions || {};
-        if (staff.status === "ACTIVE" && (userRole === "GYM_MANAGER" || perms.canManageReminders === true)) {
+        if (staff.status === "ACTIVE" && perms.canManageReminders === true) {
           authorized = true;
         }
       }
@@ -412,8 +412,8 @@ async function authorizeAndResolveNotificationDispatch(params) {
     todayIso
   );
   const accessUntilMs = timestampValueToMillis(gymData.subscriptionAccessUntil);
-  const accessTimestampExpired = accessUntilMs !== null && accessUntilMs <= nowMs;
-  if (accessState.isLocked || accessTimestampExpired) {
+  const accessTimestampMissingOrExpired = accessUntilMs === null || accessUntilMs <= nowMs;
+  if (accessState.isLocked || accessTimestampMissingOrExpired) {
     await writeSecurityAuditLog(db, serverTimestamp, {
       actorUid: actor.uid,
       actorEmail: actor.email,
@@ -1408,7 +1408,7 @@ var ReminderWorker = class {
         }
         const accessState = evaluateGymSubscriptionAccess(gym, todayIso);
         const accessUntilMs = timestampValueToMillis(gym.subscriptionAccessUntil);
-        const accessExpired = accessState.isLocked || accessUntilMs !== null && accessUntilMs <= nowMs;
+        const accessExpired = accessState.isLocked || accessUntilMs === null || accessUntilMs <= nowMs;
         stats.gymsProcessed += 1;
         const settingsRef = gymDoc.ref.collection("settings").doc("default");
         const settingsSnap = await withTransientRetry(() => settingsRef.get());

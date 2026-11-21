@@ -39,7 +39,6 @@ export const AttendanceView: React.FC<AttendanceViewProps> = ({
   const today = toIsoDate();
   const canManage =
     actor.role === UserRole.GYM_OWNER ||
-    actor.role === UserRole.GYM_MANAGER ||
     actor.role === UserRole.SUPER_ADMIN ||
     permissions.canManageAttendance;
 

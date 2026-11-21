@@ -399,6 +399,40 @@ function seedMultiTenantNotificationFixtures(db: InMemoryFirestore) {
     permissions: { canManageReminders: true },
   });
 
+  db.store.set('users/manager_noperm', {
+    uid: 'manager_noperm',
+    email: 'mgr.noperm@alpha.test',
+    displayName: 'Manager NoPerm',
+    role: UserRole.GYM_MANAGER,
+    gymId: 'gym_a',
+    status: UserStatus.ACTIVE,
+  });
+  db.store.set('gyms/gym_a/staff/manager_noperm', {
+    id: 'manager_noperm',
+    gymId: 'gym_a',
+    uid: 'manager_noperm',
+    role: UserRole.GYM_MANAGER,
+    status: UserStatus.ACTIVE,
+    permissions: { canManageReminders: false },
+  });
+
+  db.store.set('users/manager_perm', {
+    uid: 'manager_perm',
+    email: 'mgr.perm@alpha.test',
+    displayName: 'Manager Perm',
+    role: UserRole.GYM_MANAGER,
+    gymId: 'gym_a',
+    status: UserStatus.ACTIVE,
+  });
+  db.store.set('gyms/gym_a/staff/manager_perm', {
+    id: 'manager_perm',
+    gymId: 'gym_a',
+    uid: 'manager_perm',
+    role: UserRole.GYM_MANAGER,
+    status: UserStatus.ACTIVE,
+    permissions: { canManageReminders: true },
+  });
+
   // Members
   db.store.set('gyms/gym_a/members/mem_a1', {
     id: 'mem_a1',
@@ -563,9 +597,45 @@ describe('Server Security — Notification API Authorization & Rate Limiting', (
       })
     ).rejects.toMatchObject({ status: 400, code: 'MEMBER_OPTED_OUT' });
 
+    // Manager WITHOUT canManageReminders is rejected (no blanket role bypass)
+    await expect(
+      authorizeAndResolveNotificationDispatch({
+        db,
+        rateLimiter: limiter,
+        actor: { uid: 'manager_noperm', email: 'mgr.noperm@alpha.test', emailVerified: true },
+        body: { gymId: 'gym_a', memberId: 'mem_a1', channel: 'EMAIL', message: 'Hi' },
+        serverTimestamp: ts,
+      })
+    ).rejects.toMatchObject({ status: 403, code: 'FORBIDDEN_NOTIFICATION_ROLE' });
+
+    // Manager WITH canManageReminders succeeds
+    const mgrPermDispatch = await authorizeAndResolveNotificationDispatch({
+      db,
+      rateLimiter: limiter,
+      actor: { uid: 'manager_perm', email: 'mgr.perm@alpha.test', emailVerified: true },
+      body: { gymId: 'gym_a', memberId: 'mem_a1', channel: 'EMAIL', message: 'Friendly reminder' },
+      serverTimestamp: ts,
+    });
+    expect(mgrPermDispatch.recipient).toBe('riya@member.test');
+
+    // Gym missing subscriptionAccessUntil fails closed
+    const gymNoAccess = { ...db.store.get('gyms/gym_a')! };
+    delete gymNoAccess.subscriptionAccessUntil;
+    db.store.set('gyms/gym_a', gymNoAccess);
+    await expect(
+      authorizeAndResolveNotificationDispatch({
+        db,
+        rateLimiter: limiter,
+        actor: { uid: 'owner_a', email: 'owner.a@alpha.test', emailVerified: true },
+        body: { gymId: 'gym_a', memberId: 'mem_a1', channel: 'EMAIL', message: 'Hi' },
+        serverTimestamp: ts,
+      })
+    ).rejects.toMatchObject({ status: 403, code: 'GYM_INACTIVE' });
+
     // Suspended gym rejected
     db.store.set('gyms/gym_a', {
       ...db.store.get('gyms/gym_a')!,
+      subscriptionAccessUntil: new Date('2099-12-31T23:59:59.000Z'),
       accountStatus: AccountStatus.SUSPENDED,
     });
     await expect(
@@ -1019,5 +1089,65 @@ describe('Automated Backend Reminder Worker — Generation, Retries, Backoff & L
     const blockedSweep = await worker.sweep({ nowMs: tRetry3 + 1000 });
     expect(blockedSweep.skipped).toBe(true);
     expect(blockedSweep.reason).toContain('reminder_worker');
+  });
+
+  it('fails closed in ReminderWorker when subscriptionAccessUntil is missing on an otherwise ACTIVE gym', async () => {
+    const db = new InMemoryFirestore();
+    db.store.set('gyms/gym_missing_access', {
+      id: 'gym_missing_access',
+      name: 'No Access Timestamp Gym',
+      ownerUid: 'owner_m',
+      ownerName: 'Missing Ts Owner',
+      email: 'missing@gym.test',
+      phone: '9876543200',
+      accountStatus: AccountStatus.ACTIVE,
+      subscriptionStatus: SubscriptionStatus.ACTIVE,
+      subscriptionStartAt: '2025-05-01',
+      subscriptionEndAt: '2099-12-31',
+      gracePeriodDays: 7,
+      renewalPolicy: RenewalPolicy.EXTEND_FROM_EXPIRY,
+    });
+    db.store.set('gyms/gym_missing_access/settings/default', {
+      gymId: 'gym_missing_access',
+      gracePeriodDays: 7,
+      renewalPolicy: RenewalPolicy.EXTEND_FROM_EXPIRY,
+      reminderDaysBefore: [3],
+      sendOnExpiryDay: true,
+      sendAfterExpiryDays: [],
+      emailEnabled: true,
+      inAppEnabled: true,
+      whatsappEnabled: false,
+      currencySymbol: '₹',
+    });
+    db.store.set('gyms/gym_missing_access/members/m1', {
+      id: 'm1',
+      gymId: 'gym_missing_access',
+      memberCode: 'M-01',
+      fullName: 'Should Skip',
+      phone: '9988776611',
+      email: 'skip@member.test',
+      joiningDate: '2025-05-01',
+      membershipExpiryDate: '2025-06-13',
+      membershipStatus: MembershipStatus.EXPIRING_SOON,
+      outstandingBalance: 0,
+      reminderOptOut: false,
+      isArchived: false,
+    });
+
+    const worker = new ReminderWorker({
+      db,
+      sendEmail: async () => ({ delivered: true, providerMessageId: 'm1', sentAt: new Date().toISOString() }),
+      sendWhatsApp: async () => ({ delivered: false }),
+      serverTimestamp: ts,
+      intervalMinutes: 30,
+      orderByField: 'id',
+    });
+
+    const sweep = await worker.sweep({ nowMs: Date.parse('2025-06-10T08:00:00.000Z') });
+    expect(sweep.gymsProcessed).toBe(1);
+    const logs = [...db.store.entries()].filter(([k]) =>
+      k.startsWith('gyms/gym_missing_access/notification_logs/')
+    );
+    expect(logs.some(([, v]) => v.memberId === 'm1')).toBe(false);
   });
 });

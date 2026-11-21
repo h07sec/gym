@@ -35,7 +35,6 @@ export const MembershipPlansView: React.FC<MembershipPlansViewProps> = ({
   const currency = settings.currencySymbol || '₹';
   const canManage =
     actor.role === UserRole.GYM_OWNER ||
-    actor.role === UserRole.GYM_MANAGER ||
     actor.role === UserRole.SUPER_ADMIN ||
     permissions.canManagePlans;
 

@@ -501,7 +501,7 @@ export class ReminderWorker {
         const accessState = evaluateGymSubscriptionAccess(gym, todayIso);
         const accessUntilMs = timestampValueToMillis(gym.subscriptionAccessUntil);
         const accessExpired =
-          accessState.isLocked || (accessUntilMs !== null && accessUntilMs <= nowMs);
+          accessState.isLocked || accessUntilMs === null || accessUntilMs <= nowMs;
 
         stats.gymsProcessed += 1;
 

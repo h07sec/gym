@@ -38,6 +38,7 @@ import { deriveMemberMembershipStatus } from '../../lib/domain/dates';
 import {
   calculateNetPlanAmount,
   canStaffConfirmPayment,
+  canStaffRecordPayment,
   canStaffViewPayments,
   deriveMemberPaymentDisplayStatus,
 } from '../../lib/domain/payments';
@@ -97,6 +98,11 @@ export const MembersView: React.FC<MembersViewProps> = ({
   const [csvText, setCsvText] = useState('');
   const [importPreview, setImportPreview] = useState<CsvImportRowResult[]>([]);
 
+  const canManageMembers =
+    actor.role === UserRole.GYM_OWNER ||
+    actor.role === UserRole.SUPER_ADMIN ||
+    Boolean(permissions.canManageMembers);
+  const canRecordPayments = canStaffRecordPayment(actor.role, permissions);
   const canConfirmPayments = canStaffConfirmPayment(actor.role, permissions);
   const canViewPayments = canStaffViewPayments(actor.role, permissions);
 
@@ -195,10 +201,16 @@ export const MembersView: React.FC<MembersViewProps> = ({
 
   const handleRegister = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (!canManageMembers) {
+      setErrorMsg('You do not have permission to register members.');
+      return;
+    }
     setBusy(true);
     setErrorMsg(null);
     try {
       const plan = activePlans.find((p) => p.id === addForm.planId);
+      const parsedPayAmount =
+        canRecordPayments && addForm.paymentAmount ? Number(addForm.paymentAmount) : 0;
       await createGymMember(actor, gym, {
         fullName: addForm.fullName,
         phone: addForm.phone,
@@ -214,10 +226,10 @@ export const MembersView: React.FC<MembersViewProps> = ({
         discountAmount: addForm.discountAmount ? Number(addForm.discountAmount) : 0,
         discountReason: addForm.discountReason,
         dueDate: addForm.dueDate || undefined,
-        paymentAmount: addForm.paymentAmount ? Number(addForm.paymentAmount) : 0,
+        paymentAmount: parsedPayAmount,
         paymentMode: addForm.paymentMode,
         transactionReference: addForm.transactionReference,
-        confirmPaymentNow: canConfirmPayments && addForm.confirmPaymentNow,
+        confirmPaymentNow: canRecordPayments && canConfirmPayments && addForm.confirmPaymentNow,
       });
       setShowAddModal(false);
       setAddForm({
@@ -250,7 +262,7 @@ export const MembersView: React.FC<MembersViewProps> = ({
 
   const handleEditSave = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!editingMember) return;
+    if (!editingMember || !canManageMembers) return;
     setBusy(true);
     try {
       await updateGymMember(actor, gym.id, editingMember.id, {
@@ -275,7 +287,7 @@ export const MembersView: React.FC<MembersViewProps> = ({
 
   const handleRenewSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!renewMember) return;
+    if (!renewMember || !canManageMembers) return;
     const plan = plans.find((p) => p.id === renewForm.planId) || plans[0];
     if (!plan) {
       setErrorMsg('Create a membership plan first.');
@@ -284,15 +296,17 @@ export const MembersView: React.FC<MembersViewProps> = ({
     setBusy(true);
     setErrorMsg(null);
     try {
+      const parsedAmountPaidNow =
+        canRecordPayments && renewForm.amountPaidNow ? Number(renewForm.amountPaidNow) : 0;
       await assignOrRenewMembership(actor, gym, renewMember, plan, renewForm.actionType, settings, {
         customExpiryDate: renewForm.customExpiryDate,
         discountAmount: renewForm.discountAmount ? Number(renewForm.discountAmount) : 0,
         discountReason: renewForm.discountReason,
         dueDate: renewForm.dueDate || undefined,
-        amountPaidNow: renewForm.amountPaidNow ? Number(renewForm.amountPaidNow) : 0,
+        amountPaidNow: parsedAmountPaidNow,
         paymentMode: renewForm.paymentMode,
         transactionReference: renewForm.transactionReference,
-        confirmPaymentNow: canConfirmPayments && renewForm.confirmPaymentNow,
+        confirmPaymentNow: canRecordPayments && canConfirmPayments && renewForm.confirmPaymentNow,
         notes: renewForm.notes,
       });
       setRenewMember(null);
@@ -305,7 +319,7 @@ export const MembersView: React.FC<MembersViewProps> = ({
   };
 
   const handleCancelMembershipConfirm = async (reason?: string) => {
-    if (!cancellingMember || !reason) return;
+    if (!cancellingMember || !reason || !canManageMembers) return;
     setErrorMsg(null);
     try {
       const activeMs = memberships.find(
@@ -338,6 +352,7 @@ export const MembersView: React.FC<MembersViewProps> = ({
   };
 
   const handleImportCommit = async () => {
+    if (!canManageMembers) return;
     const validRows = importPreview.filter((r) => r.isValid && !r.isDuplicate);
     if (validRows.length === 0) return;
     setBusy(true);
@@ -354,7 +369,10 @@ export const MembersView: React.FC<MembersViewProps> = ({
     }
   };
 
-  const canDelete = actor.role === UserRole.GYM_OWNER || permissions.canDeleteMembers;
+  const canDelete =
+    actor.role === UserRole.GYM_OWNER ||
+    actor.role === UserRole.SUPER_ADMIN ||
+    Boolean(permissions.canDeleteMembers);
 
   return (
     <div className="space-y-5">
@@ -416,22 +434,26 @@ export const MembersView: React.FC<MembersViewProps> = ({
             <Download className="w-3.5 h-3.5" />
             Export CSV
           </button>
-          <button
-            type="button"
-            onClick={() => setShowImportModal(true)}
-            className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium text-slate-700 bg-white border border-slate-200 rounded-md hover:bg-slate-50 cursor-pointer"
-          >
-            <Upload className="w-3.5 h-3.5" />
-            Import CSV
-          </button>
-          <button
-            type="button"
-            onClick={() => setShowAddModal(true)}
-            className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-medium text-white bg-teal-700 rounded-md hover:bg-teal-800 cursor-pointer"
-          >
-            <Plus className="w-4 h-4" />
-            Add Member
-          </button>
+          {canManageMembers && (
+            <>
+              <button
+                type="button"
+                onClick={() => setShowImportModal(true)}
+                className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium text-slate-700 bg-white border border-slate-200 rounded-md hover:bg-slate-50 cursor-pointer"
+              >
+                <Upload className="w-3.5 h-3.5" />
+                Import CSV
+              </button>
+              <button
+                type="button"
+                onClick={() => setShowAddModal(true)}
+                className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-medium text-white bg-teal-700 rounded-md hover:bg-teal-800 cursor-pointer"
+              >
+                <Plus className="w-4 h-4" />
+                Add Member
+              </button>
+            </>
+          )}
         </div>
       </div>
 
@@ -522,32 +544,38 @@ export const MembersView: React.FC<MembersViewProps> = ({
                           >
                             <Eye className="w-3.5 h-3.5" />
                           </button>
-                          <button
-                            type="button"
-                            onClick={() => {
-                              setRenewMember(m);
-                              const defaultPlan =
-                                plans.find((p) => p.id === m.currentPlanId) || activePlans[0];
-                              setRenewForm({
-                                planId: defaultPlan?.id || '',
-                                actionType: MembershipActionType.RENEWAL,
-                                customExpiryDate: m.membershipExpiryDate || today,
-                                discountAmount: '',
-                                discountReason: '',
-                                dueDate: '',
-                                amountPaidNow: defaultPlan ? String(defaultPlan.price) : '',
-                                paymentMode: PaymentMode.CASH,
-                                transactionReference: '',
-                                confirmPaymentNow: canConfirmPayments,
-                                notes: '',
-                              });
-                            }}
-                            className="p-1.5 text-teal-700 hover:bg-teal-50 rounded cursor-pointer"
-                            title="Renew / Assign / Upgrade membership"
-                          >
-                            <RefreshCw className="w-3.5 h-3.5" />
-                          </button>
-                          {!m.isArchived &&
+                          {canManageMembers && (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setRenewMember(m);
+                                const defaultPlan =
+                                  plans.find((p) => p.id === m.currentPlanId) || activePlans[0];
+                                setRenewForm({
+                                  planId: defaultPlan?.id || '',
+                                  actionType: MembershipActionType.RENEWAL,
+                                  customExpiryDate: m.membershipExpiryDate || today,
+                                  discountAmount: '',
+                                  discountReason: '',
+                                  dueDate: '',
+                                  amountPaidNow:
+                                    canRecordPayments && defaultPlan
+                                      ? String(defaultPlan.price)
+                                      : '',
+                                  paymentMode: PaymentMode.CASH,
+                                  transactionReference: '',
+                                  confirmPaymentNow: canRecordPayments && canConfirmPayments,
+                                  notes: '',
+                                });
+                              }}
+                              className="p-1.5 text-teal-700 hover:bg-teal-50 rounded cursor-pointer"
+                              title="Renew / Assign / Upgrade membership"
+                            >
+                              <RefreshCw className="w-3.5 h-3.5" />
+                            </button>
+                          )}
+                          {canManageMembers &&
+                            !m.isArchived &&
                             m.currentPlanId &&
                             m.membershipStatus !== MembershipStatus.CANCELLED && (
                               <button
@@ -559,33 +587,37 @@ export const MembersView: React.FC<MembersViewProps> = ({
                                 <Ban className="w-3.5 h-3.5" />
                               </button>
                             )}
-                          <button
-                            type="button"
-                            onClick={() => setEditingMember({ ...m })}
-                            className="p-1.5 text-slate-500 hover:text-slate-900 hover:bg-slate-100 rounded cursor-pointer"
-                            title="Edit member"
-                          >
-                            <Edit2 className="w-3.5 h-3.5" />
-                          </button>
-                          <button
-                            type="button"
-                            onClick={async () => {
-                              setErrorMsg(null);
-                              try {
-                                await updateGymMember(actor, gym.id, m.id, {
-                                  isArchived: !m.isArchived,
-                                });
-                              } catch (err) {
-                                setErrorMsg(
-                                  err instanceof Error ? err.message : 'Failed to update archive status.'
-                                );
-                              }
-                            }}
-                            className="p-1.5 text-slate-500 hover:text-amber-700 hover:bg-amber-50 rounded cursor-pointer"
-                            title={m.isArchived ? 'Restore member' : 'Archive member'}
-                          >
-                            <Archive className="w-3.5 h-3.5" />
-                          </button>
+                          {canManageMembers && (
+                            <button
+                              type="button"
+                              onClick={() => setEditingMember({ ...m })}
+                              className="p-1.5 text-slate-500 hover:text-slate-900 hover:bg-slate-100 rounded cursor-pointer"
+                              title="Edit member"
+                            >
+                              <Edit2 className="w-3.5 h-3.5" />
+                            </button>
+                          )}
+                          {canManageMembers && (
+                            <button
+                              type="button"
+                              onClick={async () => {
+                                setErrorMsg(null);
+                                try {
+                                  await updateGymMember(actor, gym.id, m.id, {
+                                    isArchived: !m.isArchived,
+                                  });
+                                } catch (err) {
+                                  setErrorMsg(
+                                    err instanceof Error ? err.message : 'Failed to update archive status.'
+                                  );
+                                }
+                              }}
+                              className="p-1.5 text-slate-500 hover:text-amber-700 hover:bg-amber-50 rounded cursor-pointer"
+                              title={m.isArchived ? 'Restore member' : 'Archive member'}
+                            >
+                              <Archive className="w-3.5 h-3.5" />
+                            </button>
+                          )}
                           {canDelete && m.isArchived && (
                             <button
                               type="button"
@@ -615,7 +647,7 @@ export const MembersView: React.FC<MembersViewProps> = ({
 
       {/* Add Member Modal */}
       <Modal
-        open={showAddModal}
+        open={canManageMembers && showAddModal}
         title="Register New Member"
         subtitle="Creates a unique Member ID and optional initial membership & payment"
         onClose={() => setShowAddModal(false)}
@@ -718,7 +750,7 @@ export const MembersView: React.FC<MembersViewProps> = ({
                     setAddForm({
                       ...addForm,
                       planId: e.target.value,
-                      paymentAmount: p ? String(net) : '',
+                      paymentAmount: canRecordPayments && p ? String(net) : '',
                     });
                   }}
                   className="px-3 py-2 text-xs border border-slate-200 rounded-md"
@@ -730,7 +762,7 @@ export const MembersView: React.FC<MembersViewProps> = ({
                     </option>
                   ))}
                 </select>
-                {addForm.planId && (
+                {addForm.planId && canRecordPayments && (
                   <input
                     type="number"
                     min="0"
@@ -761,7 +793,7 @@ export const MembersView: React.FC<MembersViewProps> = ({
                         setAddForm({
                           ...addForm,
                           discountAmount: val,
-                          paymentAmount: String(net),
+                          paymentAmount: canRecordPayments ? String(net) : '',
                         });
                       }}
                       className="w-full px-3 py-1.5 text-xs border border-slate-200 rounded-md font-mono"
@@ -795,7 +827,7 @@ export const MembersView: React.FC<MembersViewProps> = ({
                   </p>
                 </div>
               )}
-              {addForm.planId && Number(addForm.paymentAmount) > 0 && (
+              {addForm.planId && canRecordPayments && Number(addForm.paymentAmount) > 0 && (
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mt-3">
                   <select
                     value={addForm.paymentMode}
@@ -872,7 +904,7 @@ export const MembersView: React.FC<MembersViewProps> = ({
 
       {/* Edit Member Modal */}
       <Modal
-        open={Boolean(editingMember)}
+        open={canManageMembers && Boolean(editingMember)}
         title={`Edit Member · ${editingMember?.fullName}`}
         onClose={() => setEditingMember(null)}
       >
@@ -969,7 +1001,7 @@ export const MembersView: React.FC<MembersViewProps> = ({
 
       {/* Renew / Upgrade / Extend Modal */}
       <Modal
-        open={Boolean(renewMember)}
+        open={canManageMembers && Boolean(renewMember)}
         title={`Membership Action · ${renewMember?.fullName}`}
         subtitle={`Current expiry: ${formatDisplayDate(renewMember?.membershipExpiryDate)} · Policy: ${settings.renewalPolicy.replace(/_/g, ' ')}`}
         onClose={() => setRenewMember(null)}
@@ -1005,7 +1037,7 @@ export const MembersView: React.FC<MembersViewProps> = ({
                   setRenewForm({
                     ...renewForm,
                     planId: e.target.value,
-                    amountPaidNow: p ? String(net) : '',
+                    amountPaidNow: canRecordPayments && p ? String(net) : '',
                   });
                 }}
                 className="w-full px-3 py-2 text-xs border border-slate-200 rounded-md"
@@ -1052,7 +1084,7 @@ export const MembersView: React.FC<MembersViewProps> = ({
                       setRenewForm({
                         ...renewForm,
                         discountAmount: val,
-                        amountPaidNow: String(net),
+                        amountPaidNow: canRecordPayments ? String(net) : '',
                       });
                     }}
                     className="w-full px-3 py-2 text-xs border border-slate-200 rounded-md font-mono"
@@ -1082,30 +1114,34 @@ export const MembersView: React.FC<MembersViewProps> = ({
               </>
             )}
 
-            <div>
-              <label className="block text-xs font-medium text-slate-700 mb-1">Amount Paid Now</label>
-              <input
-                type="number"
-                min="0"
-                step="0.01"
-                value={renewForm.amountPaidNow}
-                onChange={(e) => setRenewForm({ ...renewForm, amountPaidNow: e.target.value })}
-                className="w-full px-3 py-2 text-xs border border-slate-200 rounded-md font-mono"
-              />
-            </div>
-            <div>
-              <label className="block text-xs font-medium text-slate-700 mb-1">Payment Mode</label>
-              <select
-                value={renewForm.paymentMode}
-                onChange={(e) =>
-                  setRenewForm({ ...renewForm, paymentMode: e.target.value as PaymentMode })
-                }
-                className="w-full px-3 py-2 text-xs border border-slate-200 rounded-md"
-              >
-                <option value={PaymentMode.CASH}>Cash</option>
-                <option value={PaymentMode.UPI}>UPI</option>
-              </select>
-            </div>
+            {canRecordPayments && (
+              <>
+                <div>
+                  <label className="block text-xs font-medium text-slate-700 mb-1">Amount Paid Now</label>
+                  <input
+                    type="number"
+                    min="0"
+                    step="0.01"
+                    value={renewForm.amountPaidNow}
+                    onChange={(e) => setRenewForm({ ...renewForm, amountPaidNow: e.target.value })}
+                    className="w-full px-3 py-2 text-xs border border-slate-200 rounded-md font-mono"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-slate-700 mb-1">Payment Mode</label>
+                  <select
+                    value={renewForm.paymentMode}
+                    onChange={(e) =>
+                      setRenewForm({ ...renewForm, paymentMode: e.target.value as PaymentMode })
+                    }
+                    className="w-full px-3 py-2 text-xs border border-slate-200 rounded-md"
+                  >
+                    <option value={PaymentMode.CASH}>Cash</option>
+                    <option value={PaymentMode.UPI}>UPI</option>
+                  </select>
+                </div>
+              </>
+            )}
             <div>
               <label className="block text-xs font-medium text-slate-700 mb-1">
                 Balance Due Date (if partial)
@@ -1126,7 +1162,9 @@ export const MembersView: React.FC<MembersViewProps> = ({
                 className="w-full px-3 py-2 text-xs border border-slate-200 rounded-md"
               />
             </div>
-            {renewForm.paymentMode === PaymentMode.UPI && Number(renewForm.amountPaidNow) > 0 && (
+            {canRecordPayments &&
+              renewForm.paymentMode === PaymentMode.UPI &&
+              Number(renewForm.amountPaidNow) > 0 && (
               <div className="col-span-2">
                 <label className="block text-xs font-medium text-slate-700 mb-1">UPI Reference</label>
                 <input
@@ -1139,7 +1177,7 @@ export const MembersView: React.FC<MembersViewProps> = ({
                 />
               </div>
             )}
-            {canConfirmPayments && (
+            {canRecordPayments && canConfirmPayments && (
               <label className="col-span-2 flex items-center gap-2 text-xs text-slate-700 cursor-pointer">
                 <input
                   type="checkbox"
@@ -1252,50 +1290,52 @@ export const MembersView: React.FC<MembersViewProps> = ({
               </div>
             </div>
 
-            <div>
-              <h4 className="font-semibold text-slate-900 mb-2">Payment History</h4>
-              <div className="border border-slate-200 rounded-md overflow-hidden">
-                {payments.filter((p) => p.memberId === profileMember.id).length === 0 ? (
-                  <p className="p-3 text-slate-500">No payments recorded for this member.</p>
-                ) : (
-                  <table className="w-full text-left">
-                    <thead className="bg-slate-50 border-b border-slate-200 text-slate-500">
-                      <tr>
-                        <th className="px-3 py-2">Date</th>
-                        <th className="px-3 py-2">Code</th>
-                        <th className="px-3 py-2">Mode</th>
-                        <th className="px-3 py-2 text-right">Amount</th>
-                        <th className="px-3 py-2">Status</th>
-                      </tr>
-                    </thead>
-                    <tbody className="divide-y divide-slate-200">
-                      {payments
-                        .filter((p) => p.memberId === profileMember.id)
-                        .map((p) => (
-                          <tr key={p.id}>
-                            <td className="px-3 py-2 font-mono">{p.paymentDate}</td>
-                            <td className="px-3 py-2 font-mono">{p.paymentCode}</td>
-                            <td className="px-3 py-2">{p.paymentMode}</td>
-                            <td className="px-3 py-2 font-mono text-right">
-                              {formatCurrency(p.amount, currency)}
-                            </td>
-                            <td className="px-3 py-2">
-                              <StatusLabel status={p.status} />
-                            </td>
-                          </tr>
-                        ))}
-                    </tbody>
-                  </table>
-                )}
+            {canViewPayments && (
+              <div>
+                <h4 className="font-semibold text-slate-900 mb-2">Payment History</h4>
+                <div className="border border-slate-200 rounded-md overflow-hidden">
+                  {payments.filter((p) => p.memberId === profileMember.id).length === 0 ? (
+                    <p className="p-3 text-slate-500">No payments recorded for this member.</p>
+                  ) : (
+                    <table className="w-full text-left">
+                      <thead className="bg-slate-50 border-b border-slate-200 text-slate-500">
+                        <tr>
+                          <th className="px-3 py-2">Date</th>
+                          <th className="px-3 py-2">Code</th>
+                          <th className="px-3 py-2">Mode</th>
+                          <th className="px-3 py-2 text-right">Amount</th>
+                          <th className="px-3 py-2">Status</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-200">
+                        {payments
+                          .filter((p) => p.memberId === profileMember.id)
+                          .map((p) => (
+                            <tr key={p.id}>
+                              <td className="px-3 py-2 font-mono">{p.paymentDate}</td>
+                              <td className="px-3 py-2 font-mono">{p.paymentCode}</td>
+                              <td className="px-3 py-2">{p.paymentMode}</td>
+                              <td className="px-3 py-2 font-mono text-right">
+                                {formatCurrency(p.amount, currency)}
+                              </td>
+                              <td className="px-3 py-2">
+                                <StatusLabel status={p.status} />
+                              </td>
+                            </tr>
+                          ))}
+                      </tbody>
+                    </table>
+                  )}
+                </div>
               </div>
-            </div>
+            )}
           </div>
         )}
       </Modal>
 
       {/* CSV Import Modal */}
       <Modal
-        open={showImportModal}
+        open={canManageMembers && showImportModal}
         title="Import Members from CSV"
         subtitle="Columns: Full Name, Phone, Email, Gender, Joining Date (YYYY-MM-DD), Notes"
         onClose={() => setShowImportModal(false)}
@@ -1372,7 +1412,7 @@ export const MembersView: React.FC<MembersViewProps> = ({
       </Modal>
 
       <ConfirmModal
-        open={Boolean(cancellingMember)}
+        open={canManageMembers && Boolean(cancellingMember)}
         title={`Cancel Membership · ${cancellingMember?.fullName || ''}`}
         description="Cancels the member's active plan and clears the current expiry date while preserving all payment and membership history."
         confirmLabel="Cancel Membership"

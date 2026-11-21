@@ -45,10 +45,9 @@ export const RemindersView: React.FC<RemindersViewProps> = ({
   logs,
   notifications,
 }) => {
-  const canConfigure =
-    actor.role === UserRole.GYM_OWNER ||
-    actor.role === UserRole.GYM_MANAGER ||
-    permissions.canManageReminders;
+  const isOwner =
+    actor.role === UserRole.GYM_OWNER || actor.role === UserRole.SUPER_ADMIN;
+  const canConfigure = isOwner || Boolean(permissions.canManageReminders);
 
   const [daysBeforeText, setDaysBeforeText] = useState(
     settings.reminderDaysBefore.join(', ')
@@ -143,16 +142,24 @@ export const RemindersView: React.FC<RemindersViewProps> = ({
         overduePaymentReminderDays: overdueArr,
         ownerSubReminderDays: ownerSubArr,
         emailEnabled,
-        emailFromName: settings.emailFromName || gym.name,
+        emailFromName: isOwner ? settings.emailFromName || gym.name : settings.emailFromName,
         inAppEnabled,
-        whatsappEnabled: Boolean(
-          whatsappEnabled && whatsappPhoneId.trim() && whatsappTemplate.trim()
-        ),
-        ...(whatsappPhoneId.trim()
-          ? { whatsappPhoneNumberId: whatsappPhoneId.trim() }
+        whatsappEnabled: isOwner
+          ? Boolean(whatsappEnabled && whatsappPhoneId.trim() && whatsappTemplate.trim())
+          : settings.whatsappEnabled,
+        ...(isOwner
+          ? whatsappPhoneId.trim()
+            ? { whatsappPhoneNumberId: whatsappPhoneId.trim() }
+            : {}
+          : settings.whatsappPhoneNumberId !== undefined
+          ? { whatsappPhoneNumberId: settings.whatsappPhoneNumberId }
           : {}),
-        ...(whatsappTemplate.trim()
-          ? { whatsappApprovedTemplate: whatsappTemplate.trim() }
+        ...(isOwner
+          ? whatsappTemplate.trim()
+            ? { whatsappApprovedTemplate: whatsappTemplate.trim() }
+            : {}
+          : settings.whatsappApprovedTemplate !== undefined
+          ? { whatsappApprovedTemplate: settings.whatsappApprovedTemplate }
           : {}),
         currencySymbol: settings.currencySymbol,
       });
@@ -416,17 +423,17 @@ export const RemindersView: React.FC<RemindersViewProps> = ({
               <label className="flex items-center gap-2 text-xs text-slate-700 cursor-pointer">
                 <input
                   type="checkbox"
-                  disabled={!canConfigure}
+                  disabled={!isOwner}
                   checked={whatsappEnabled}
                   onChange={(e) => setWhatsappEnabled(e.target.checked)}
                 />
-                WhatsApp Business Notifications
+                WhatsApp Business Notifications {isOwner ? '' : '(Owner managed)'}
               </label>
               {whatsappEnabled && (
                 <div className="space-y-2 pl-5">
                   <input
                     type="text"
-                    disabled={!canConfigure}
+                    disabled={!isOwner}
                     placeholder="WhatsApp Phone Number ID"
                     value={whatsappPhoneId}
                     onChange={(e) => setWhatsappPhoneId(e.target.value)}
@@ -434,7 +441,7 @@ export const RemindersView: React.FC<RemindersViewProps> = ({
                   />
                   <input
                     type="text"
-                    disabled={!canConfigure}
+                    disabled={!isOwner}
                     placeholder="Approved Template Name"
                     value={whatsappTemplate}
                     onChange={(e) => setWhatsappTemplate(e.target.value)}

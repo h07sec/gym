@@ -54,8 +54,8 @@ export const PaymentsView: React.FC<PaymentsViewProps> = ({
   const canRecord = canStaffRecordPayment(actor.role, permissions);
   const canRefund =
     actor.role === UserRole.GYM_OWNER ||
-    actor.role === UserRole.GYM_MANAGER ||
-    actor.role === UserRole.SUPER_ADMIN;
+    actor.role === UserRole.SUPER_ADMIN ||
+    permissions.canConfirmPayments;
 
   const [search, setSearch] = useState('');
   const [statusFilter, setStatusFilter] = useState('ALL');

@@ -230,8 +230,10 @@ describe('GymOS Manual Cash/UPI Payments & RBAC Verification', () => {
     expect(calculateOutstandingAfterPayment(500, 1000, MemberPaymentPurpose.ADVANCE)).toBe(0);
   });
 
-  it('enforces payment recording, viewing, and confirmation authority by role and 8-key permissions', () => {
+  it('enforces payment recording, viewing, and confirmation authority by role and 10-key permissions', () => {
     const basePerms: StaffPermissions = {
+      canViewMembers: false,
+      canManageMembers: false,
       canViewReports: false,
       canViewPayments: false,
       canRecordPayments: false,
@@ -243,6 +245,7 @@ describe('GymOS Manual Cash/UPI Payments & RBAC Verification', () => {
     };
 
     expect(canStaffConfirmPayment(UserRole.GYM_OWNER, null)).toBe(true);
+    expect(canStaffConfirmPayment(UserRole.GYM_MANAGER, basePerms)).toBe(false);
     expect(canStaffConfirmPayment(UserRole.GYM_RECEPTIONIST, basePerms)).toBe(false);
     expect(
       canStaffConfirmPayment(UserRole.GYM_RECEPTIONIST, {
@@ -252,7 +255,13 @@ describe('GymOS Manual Cash/UPI Payments & RBAC Verification', () => {
     ).toBe(true);
 
     expect(canStaffRecordPayment(UserRole.GYM_OWNER, null)).toBe(true);
-    expect(canStaffRecordPayment(UserRole.GYM_MANAGER, basePerms)).toBe(true);
+    expect(canStaffRecordPayment(UserRole.GYM_MANAGER, basePerms)).toBe(false);
+    expect(
+      canStaffRecordPayment(UserRole.GYM_MANAGER, {
+        ...basePerms,
+        canRecordPayments: true,
+      })
+    ).toBe(true);
     expect(canStaffRecordPayment(UserRole.GYM_TRAINER, basePerms)).toBe(false);
     expect(
       canStaffRecordPayment(UserRole.GYM_TRAINER, {
@@ -261,6 +270,7 @@ describe('GymOS Manual Cash/UPI Payments & RBAC Verification', () => {
       })
     ).toBe(true);
 
+    expect(canStaffViewPayments(UserRole.GYM_MANAGER, basePerms)).toBe(false);
     expect(canStaffViewPayments(UserRole.GYM_TRAINER, basePerms)).toBe(false);
     expect(
       canStaffViewPayments(UserRole.GYM_TRAINER, {
@@ -272,6 +282,13 @@ describe('GymOS Manual Cash/UPI Payments & RBAC Verification', () => {
       canStaffViewPayments(UserRole.GYM_RECEPTIONIST, {
         ...basePerms,
         canViewPayments: false,
+        canRecordPayments: true,
+      })
+    ).toBe(false);
+    expect(
+      canStaffViewPayments(UserRole.GYM_RECEPTIONIST, {
+        ...basePerms,
+        canViewPayments: true,
         canRecordPayments: true,
       })
     ).toBe(true);
@@ -721,6 +738,13 @@ describe('GymOS Subscription Access & Grace Period Enforcement', () => {
     );
     expect(cancelled.isLocked).toBe(true);
     expect(cancelled.reason).toBe('CANCELLED');
+
+    const missingEnd = evaluateGymSubscriptionAccess(
+      { ...baseGym, subscriptionEndAt: '' },
+      '2025-06-05'
+    );
+    expect(missingEnd.isLocked).toBe(true);
+    expect(missingEnd.reason).toBe('EXPIRED');
   });
 });
 

@@ -34,11 +34,13 @@ import {
   evaluateGymSubscriptionAccess,
   type SubscriptionAccessState,
 } from '../lib/domain/subscription';
-import { toIsoDate } from '../lib/utils';
+import { timestampToIso, toIsoDate } from '../lib/utils';
 
 const ADMIN_ACTIVE_GYM_STORAGE_KEY = 'gymos_admin_active_gym_id';
 
 const DEFAULT_PERMISSIONS: StaffPermissions = {
+  canViewMembers: false,
+  canManageMembers: false,
   canViewReports: false,
   canViewPayments: false,
   canRecordPayments: false,
@@ -50,6 +52,8 @@ const DEFAULT_PERMISSIONS: StaffPermissions = {
 };
 
 const FULL_PERMISSIONS: StaffPermissions = {
+  canViewMembers: true,
+  canManageMembers: true,
   canViewReports: true,
   canViewPayments: true,
   canRecordPayments: true,
@@ -111,10 +115,16 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         where('email', '==', user.email.toLowerCase())
       );
       const invSnap = await getDocs(invQuery);
+      const nowIso = new Date().toISOString();
       setPendingInvitations(
         invSnap.docs
           .map((d) => d.data() as StaffInvitation)
-          .filter((inv) => inv.status === 'PENDING')
+          .filter((inv) => {
+            if (inv.status !== 'PENDING') return false;
+            if (!inv.expiresAt) return true;
+            const expIso = timestampToIso(inv.expiresAt);
+            return !expIso || expIso > nowIso;
+          })
       );
     } catch {
       setPendingInvitations([]);
@@ -357,18 +367,16 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       : !isStaffActive || !staffRecord
         ? DEFAULT_PERMISSIONS
         : {
+            canViewMembers: Boolean(staffRecord.permissions?.canViewMembers),
+            canManageMembers: Boolean(staffRecord.permissions?.canManageMembers),
             canViewReports: Boolean(staffRecord.permissions?.canViewReports),
-            canViewPayments:
-              staffRecord.permissions?.canViewPayments ??
-              profile?.role !== UserRole.GYM_TRAINER,
-            canRecordPayments:
-              staffRecord.permissions?.canRecordPayments ??
-              profile?.role !== UserRole.GYM_TRAINER,
+            canViewPayments: Boolean(staffRecord.permissions?.canViewPayments),
+            canRecordPayments: Boolean(staffRecord.permissions?.canRecordPayments),
             canManagePlans: Boolean(staffRecord.permissions?.canManagePlans),
             canConfirmPayments: Boolean(staffRecord.permissions?.canConfirmPayments),
             canDeleteMembers: Boolean(staffRecord.permissions?.canDeleteMembers),
             canManageReminders: Boolean(staffRecord.permissions?.canManageReminders),
-            canManageAttendance: staffRecord.permissions?.canManageAttendance ?? true,
+            canManageAttendance: Boolean(staffRecord.permissions?.canManageAttendance),
           };
 
   return (

@@ -91,7 +91,7 @@
         "createdAt": { "type": "string", "format": "date-time" },
         "updatedAt": { "type": "string", "format": "date-time" }
       },
-      "required": ["id", "name", "ownerUid", "ownerName", "email", "phone", "accountStatus", "subscriptionStatus", "subscriptionPlanId", "subscriptionPlanName", "subscriptionStartAt", "subscriptionEndAt", "gracePeriodDays", "renewalPolicy", "createdAt", "updatedAt"]
+      "required": ["id", "name", "ownerUid", "ownerName", "email", "phone", "accountStatus", "subscriptionStatus", "subscriptionPlanId", "subscriptionPlanName", "subscriptionStartAt", "subscriptionEndAt", "subscriptionAccessUntil", "gracePeriodDays", "renewalPolicy", "createdAt", "updatedAt"]
     },
     "SubscriptionPayment": {
       "title": "SubscriptionPayment",
@@ -185,6 +185,7 @@
         "status": { "type": "string", "enum": ["PENDING", "ACCEPTED", "REVOKED"] },
         "invitedByUid": { "type": "string", "maxLength": 128 },
         "acceptedByUid": { "type": "string", "maxLength": 128 },
+        "expiresAt": { "type": "string", "format": "date-time" },
         "createdAt": { "type": "string", "format": "date-time" },
         "updatedAt": { "type": "string", "format": "date-time" }
       },

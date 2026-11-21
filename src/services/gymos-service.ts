@@ -70,7 +70,7 @@ import {
   evaluateDueReminders,
 } from '../lib/domain/reminders';
 import { computeEffectiveAccessEndIso } from '../lib/domain/subscription';
-import { generateHumanCode, generateSecureId, toIsoDate } from '../lib/utils';
+import { generateHumanCode, generateSecureId, timestampToIso, toIsoDate } from '../lib/utils';
 
 export interface ActorContext {
   uid: string;
@@ -136,7 +136,7 @@ async function appendAuditLog(
   const payload: Record<string, unknown> = {
     id,
     actorUid: actor.uid,
-    actorEmail: actor.email,
+    actorEmail: actor.email.trim().toLowerCase(),
     actorRole: actor.role,
     action,
     entityType,
@@ -530,6 +530,8 @@ export async function saveSubscriptionPlan(
 // Gym Onboarding (Public Owner Registration & Super Admin Manual Creation)
 // ---------------------------------------------------------------------------
 const FULL_OWNER_PERMISSIONS: StaffPermissions = {
+  canViewMembers: true,
+  canManageMembers: true,
   canViewReports: true,
   canViewPayments: true,
   canRecordPayments: true,
@@ -732,6 +734,7 @@ export async function createGymBySuperAdmin(
       permissions: FULL_OWNER_PERMISSIONS,
       status: 'PENDING',
       invitedByUid: actor.uid,
+      expiresAt: Timestamp.fromDate(new Date(Date.now() + 7 * 86400_000)),
       createdAt: serverTimestamp(),
       updatedAt: serverTimestamp(),
     });
@@ -775,6 +778,18 @@ export async function claimOwnerInvitation(
   invitation: StaffInvitation,
   user: { uid: string; email: string; displayName: string }
 ): Promise<void> {
+  if (invitation.status !== 'PENDING') {
+    throw new Error('This invitation is no longer pending.');
+  }
+  if (invitation.email.trim().toLowerCase() !== user.email.trim().toLowerCase()) {
+    throw new Error('Signed-in email does not match the invited owner email.');
+  }
+  if (invitation.expiresAt) {
+    const expIso = timestampToIso(invitation.expiresAt);
+    if (expIso && expIso <= new Date().toISOString()) {
+      throw new Error('This invitation has expired.');
+    }
+  }
   const path = `gyms/${invitation.gymId}`;
   try {
     const batch = writeBatch(db);
@@ -1154,6 +1169,7 @@ export async function createStaffInvitation(
       permissions: input.permissions,
       status: 'PENDING',
       invitedByUid: actor.uid,
+      expiresAt: Timestamp.fromDate(new Date(Date.now() + 7 * 86400_000)),
       createdAt: serverTimestamp(),
       updatedAt: serverTimestamp(),
     });
@@ -1177,6 +1193,18 @@ export async function acceptStaffInvitation(
   invitation: StaffInvitation,
   user: { uid: string; email: string; displayName: string }
 ): Promise<void> {
+  if (invitation.status !== 'PENDING') {
+    throw new Error('This invitation is no longer pending.');
+  }
+  if (invitation.email.trim().toLowerCase() !== user.email.trim().toLowerCase()) {
+    throw new Error('Signed-in email does not match the invited email address.');
+  }
+  if (invitation.expiresAt) {
+    const expIso = timestampToIso(invitation.expiresAt);
+    if (expIso && expIso <= new Date().toISOString()) {
+      throw new Error('This invitation has expired. Ask the gym owner for a new invitation.');
+    }
+  }
   if (invitation.role === UserRole.GYM_OWNER) {
     return claimOwnerInvitation(invitation, user);
   }

@@ -115,6 +115,8 @@ export enum DeliveryStatus {
 }
 
 export interface StaffPermissions {
+  canViewMembers: boolean;
+  canManageMembers: boolean;
   canViewReports: boolean;
   canViewPayments: boolean;
   canRecordPayments: boolean;
@@ -271,6 +273,7 @@ export interface StaffInvitation {
   status: 'PENDING' | 'ACCEPTED' | 'REVOKED';
   invitedByUid: string;
   acceptedByUid?: string;
+  expiresAt?: unknown;
   createdAt: unknown;
   updatedAt: unknown;
 }

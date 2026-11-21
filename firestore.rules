@@ -7,7 +7,7 @@ service cloud.firestore {
     }
 
     // -------------------------------------------------------------------------
-    // Phase 3: Global Hardened Primitives
+    // Global Hardened Primitives & Single-Pass RBAC Helpers
     // -------------------------------------------------------------------------
     function isValidId(id) {
       let s = id;
@@ -24,6 +24,15 @@ service cloud.firestore {
 
     function isSignedIn() {
       return request.auth != null && request.auth.token.email_verified == true;
+    }
+
+    function hasVerifiedEmail() {
+      return ('email' in request.auth.token) && request.auth.token.email is string;
+    }
+
+    function emailMatches(expected) {
+      return hasVerifiedEmail() && expected is string &&
+        request.auth.token.email.lower() == expected.lower();
     }
 
     function isSuperAdmin() {
@@ -76,20 +85,6 @@ service cloud.firestore {
       );
     }
 
-    function isGymManagerOrOwnerUid(uid, gymId) {
-      let uPath = /databases/$(database)/documents/users/$(uid);
-      let u = exists(uPath) ? get(uPath).data : null;
-      let sPath = /databases/$(database)/documents/gyms/$(gymId)/staff/$(uid);
-      return u != null && u.status == 'ACTIVE' && ('gymId' in u) && u.gymId == gymId && (
-        u.role == 'GYM_OWNER' ||
-        (u.role == 'GYM_MANAGER' && exists(sPath) && get(sPath).data.status == 'ACTIVE')
-      );
-    }
-
-    function isGymManagerOrOwner(gymId) {
-      return isSignedIn() && isGymManagerOrOwnerUid(request.auth.uid, gymId);
-    }
-
     function staffPathHasPerm(sPath, permKey) {
       let s = exists(sPath) ? get(sPath).data : null;
       return s != null && s.status == 'ACTIVE' &&
@@ -112,6 +107,60 @@ service cloud.firestore {
       return isSignedIn() && staffHasPermUid(request.auth.uid, gymId, permKey);
     }
 
+    function staffHasAny2(gymId, k1, k2) {
+      let uPath = /databases/$(database)/documents/users/$(request.auth.uid);
+      let u = isSignedIn() && exists(uPath) ? get(uPath).data : null;
+      let sPath = /databases/$(database)/documents/gyms/$(gymId)/staff/$(request.auth.uid);
+      let s = (u != null && u.role in ['GYM_MANAGER', 'GYM_RECEPTIONIST', 'GYM_TRAINER'] && exists(sPath))
+        ? get(sPath).data
+        : null;
+      return u != null && u.status == 'ACTIVE' && ('gymId' in u) && u.gymId == gymId && (
+        u.role == 'GYM_OWNER' || (
+          s != null && s.status == 'ACTIVE' && ('permissions' in s) && (
+            ((k1 in s.permissions) && s.permissions[k1] == true) ||
+            ((k2 in s.permissions) && s.permissions[k2] == true)
+          )
+        )
+      );
+    }
+
+    function staffHasAny3(gymId, k1, k2, k3) {
+      let uPath = /databases/$(database)/documents/users/$(request.auth.uid);
+      let u = isSignedIn() && exists(uPath) ? get(uPath).data : null;
+      let sPath = /databases/$(database)/documents/gyms/$(gymId)/staff/$(request.auth.uid);
+      let s = (u != null && u.role in ['GYM_MANAGER', 'GYM_RECEPTIONIST', 'GYM_TRAINER'] && exists(sPath))
+        ? get(sPath).data
+        : null;
+      return u != null && u.status == 'ACTIVE' && ('gymId' in u) && u.gymId == gymId && (
+        u.role == 'GYM_OWNER' || (
+          s != null && s.status == 'ACTIVE' && ('permissions' in s) && (
+            ((k1 in s.permissions) && s.permissions[k1] == true) ||
+            ((k2 in s.permissions) && s.permissions[k2] == true) ||
+            ((k3 in s.permissions) && s.permissions[k3] == true)
+          )
+        )
+      );
+    }
+
+    function staffHasAny4(gymId, k1, k2, k3, k4) {
+      let uPath = /databases/$(database)/documents/users/$(request.auth.uid);
+      let u = isSignedIn() && exists(uPath) ? get(uPath).data : null;
+      let sPath = /databases/$(database)/documents/gyms/$(gymId)/staff/$(request.auth.uid);
+      let s = (u != null && u.role in ['GYM_MANAGER', 'GYM_RECEPTIONIST', 'GYM_TRAINER'] && exists(sPath))
+        ? get(sPath).data
+        : null;
+      return u != null && u.status == 'ACTIVE' && ('gymId' in u) && u.gymId == gymId && (
+        u.role == 'GYM_OWNER' || (
+          s != null && s.status == 'ACTIVE' && ('permissions' in s) && (
+            ((k1 in s.permissions) && s.permissions[k1] == true) ||
+            ((k2 in s.permissions) && s.permissions[k2] == true) ||
+            ((k3 in s.permissions) && s.permissions[k3] == true) ||
+            ((k4 in s.permissions) && s.permissions[k4] == true)
+          )
+        )
+      );
+    }
+
     function gymExists(gymId) {
       return exists(/databases/$(database)/documents/gyms/$(gymId));
     }
@@ -122,7 +171,35 @@ service cloud.firestore {
       return gym != null &&
         gym.accountStatus == 'ACTIVE' &&
         gym.subscriptionStatus in ['TRIAL', 'ACTIVE'] &&
-        (!('subscriptionAccessUntil' in gym) || gym.subscriptionAccessUntil > request.time);
+        ('subscriptionAccessUntil' in gym) &&
+        gym.subscriptionAccessUntil is timestamp &&
+        gym.subscriptionAccessUntil > request.time;
+    }
+
+    function isGymActiveAfter(gymId) {
+      let gymPath = /databases/$(database)/documents/gyms/$(gymId);
+      let gym = existsAfter(gymPath) ? getAfter(gymPath).data : null;
+      return gym != null &&
+        gym.accountStatus == 'ACTIVE' &&
+        gym.subscriptionStatus in ['TRIAL', 'ACTIVE'] &&
+        ('subscriptionAccessUntil' in gym) &&
+        gym.subscriptionAccessUntil is timestamp &&
+        gym.subscriptionAccessUntil > request.time;
+    }
+
+    function isValidSelfRegisteredGymSubscription(data) {
+      let planPath = /databases/$(database)/documents/subscription_plans/$(data.subscriptionPlanId);
+      let plan = exists(planPath) ? get(planPath).data : null;
+      let trialDays = (plan != null && plan.trialDays > 0) ? plan.trialDays : 14;
+      return plan != null &&
+        plan.isActive == true &&
+        data.gracePeriodDays >= 0 &&
+        data.gracePeriodDays <= 30 && (
+          (data.subscriptionStatus == 'PENDING' && data.subscriptionAccessUntil <= request.time) ||
+          (data.subscriptionStatus == 'TRIAL' &&
+            data.subscriptionAccessUntil > request.time &&
+            data.subscriptionAccessUntil <= request.time + duration.value(trialDays + data.gracePeriodDays + 2, 'd'))
+        );
     }
 
     function isOptString(data, key, maxLen) {
@@ -150,18 +227,21 @@ service cloud.firestore {
     }
 
     function isAcceptedInviteDocForUser(inv, gymId, role) {
-      return inv.email == request.auth.token.email &&
+      return emailMatches(inv.email) &&
         inv.gymId == gymId &&
         inv.role == role &&
         inv.status == 'ACCEPTED' &&
-        inv.acceptedByUid == request.auth.uid;
+        inv.acceptedByUid == request.auth.uid &&
+        (!('expiresAt' in inv) || inv.expiresAt > request.time);
     }
 
     function isAcceptedInviteForUser(invitationId, gymId, role) {
+      let invPath = /databases/$(database)/documents/invitations/$(invitationId);
       return isValidId(invitationId) &&
-        exists(/databases/$(database)/documents/invitations/$(invitationId)) &&
+        exists(invPath) &&
+        get(invPath).data.status == 'PENDING' &&
         isAcceptedInviteDocForUser(
-          getAfter(/databases/$(database)/documents/invitations/$(invitationId)).data,
+          getAfter(invPath).data,
           gymId,
           role
         );
@@ -180,10 +260,13 @@ service cloud.firestore {
     function isValidPermissionsMap(perms) {
       return perms is map &&
         perms.keys().hasOnly([
+          'canViewMembers', 'canManageMembers',
           'canViewReports', 'canViewPayments', 'canRecordPayments',
           'canManagePlans', 'canConfirmPayments', 'canDeleteMembers',
           'canManageReminders', 'canManageAttendance'
         ]) &&
+        isOptBool(perms, 'canViewMembers') &&
+        isOptBool(perms, 'canManageMembers') &&
         isOptBool(perms, 'canViewReports') &&
         isOptBool(perms, 'canViewPayments') &&
         isOptBool(perms, 'canRecordPayments') &&
@@ -195,7 +278,7 @@ service cloud.firestore {
     }
 
     // -------------------------------------------------------------------------
-    // Phase 2 & 4: Validation Blueprints (Anti-Update-Gap)
+    // Validation Blueprints (Anti-Update-Gap)
     // -------------------------------------------------------------------------
     function isValidPlatformAdmin(data) {
       return data.keys().hasAll(['uid', 'email', 'displayName', 'createdAt']) &&
@@ -267,8 +350,8 @@ service cloud.firestore {
       return data.keys().hasAll([
           'id', 'name', 'ownerUid', 'ownerName', 'email', 'phone',
           'accountStatus', 'subscriptionStatus', 'subscriptionPlanId', 'subscriptionPlanName',
-          'subscriptionStartAt', 'subscriptionEndAt', 'gracePeriodDays', 'renewalPolicy',
-          'createdAt', 'updatedAt'
+          'subscriptionStartAt', 'subscriptionEndAt', 'subscriptionAccessUntil',
+          'gracePeriodDays', 'renewalPolicy', 'createdAt', 'updatedAt'
         ]) &&
         data.keys().hasOnly([
           'id', 'name', 'ownerUid', 'ownerName', 'email', 'phone', 'address',
@@ -289,7 +372,7 @@ service cloud.firestore {
         data.subscriptionPlanName is string && data.subscriptionPlanName.size() >= 1 && data.subscriptionPlanName.size() <= 80 &&
         data.subscriptionStartAt is string && data.subscriptionStartAt.size() <= 40 &&
         data.subscriptionEndAt is string && data.subscriptionEndAt.size() <= 40 &&
-        (!('subscriptionAccessUntil' in data) || data.subscriptionAccessUntil is timestamp) &&
+        data.subscriptionAccessUntil is timestamp &&
         isOptString(data, 'ownerInvitationId', 128) &&
         data.gracePeriodDays is int && data.gracePeriodDays >= 0 && data.gracePeriodDays <= 90 &&
         data.renewalPolicy in ['EXTEND_FROM_EXPIRY', 'START_TODAY_IF_EXPIRED'] &&
@@ -398,7 +481,7 @@ service cloud.firestore {
         ]) &&
         data.keys().hasOnly([
           'id', 'gymId', 'gymName', 'email', 'fullName', 'role', 'roleTitle', 'permissions',
-          'status', 'invitedByUid', 'acceptedByUid', 'createdAt', 'updatedAt'
+          'status', 'invitedByUid', 'acceptedByUid', 'expiresAt', 'createdAt', 'updatedAt'
         ]) &&
         isValidId(data.id) &&
         isValidId(data.gymId) &&
@@ -411,6 +494,7 @@ service cloud.firestore {
         data.status in ['PENDING', 'ACCEPTED', 'REVOKED'] &&
         isValidId(data.invitedByUid) &&
         isOptString(data, 'acceptedByUid', 128) &&
+        (!('expiresAt' in data) || data.expiresAt is timestamp) &&
         data.createdAt is timestamp &&
         data.updatedAt is timestamp;
     }
@@ -678,7 +762,7 @@ service cloud.firestore {
     }
 
     // -------------------------------------------------------------------------
-    // Phase 4: Collections & Master Gate Rules
+    // Collections & Master Gate Rules
     // -------------------------------------------------------------------------
     match /platform_bootstrap/{docId} {
       allow read, write: if false;
@@ -777,7 +861,7 @@ service cloud.firestore {
           isSuperAdmin() ||
           (
             request.auth.uid == uid &&
-            incoming().email == request.auth.token.email &&
+            emailMatches(incoming().email) &&
             incoming().status == 'ACTIVE' && (
               (incoming().role == 'GYM_OWNER' &&
                 ('gymId' in incoming()) &&
@@ -790,7 +874,9 @@ service cloud.firestore {
               ) ||
               (incoming().role in ['GYM_MANAGER', 'GYM_RECEPTIONIST', 'GYM_TRAINER'] &&
                 ('gymId' in incoming()) &&
+                isValidId(incoming().gymId) &&
                 ('invitationId' in incoming()) &&
+                isGymActiveAfter(incoming().gymId) &&
                 isAcceptedInviteForUser(incoming().invitationId, incoming().gymId, incoming().role)
               )
             )
@@ -806,7 +892,8 @@ service cloud.firestore {
           ])) ||
           (request.auth.uid == uid &&
             incoming().role == existing().role &&
-            incoming().gymId == existing().gymId &&
+            ((!('gymId' in existing()) && !('gymId' in incoming())) ||
+             (('gymId' in existing()) && ('gymId' in incoming()) && incoming().gymId == existing().gymId)) &&
             incoming().status == existing().status &&
             incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'updatedAt'])
           ) ||
@@ -824,16 +911,20 @@ service cloud.firestore {
     match /invitations/{invitationId} {
       allow get: if isValidId(invitationId) && (
         isSuperAdmin() ||
-        (isSignedIn() && (existing().email == request.auth.token.email || existing().invitedByUid == request.auth.uid))
+        (isSignedIn() && (emailMatches(existing().email) || existing().invitedByUid == request.auth.uid))
       );
       allow list: if isSuperAdmin() || (
-        isSignedIn() && (existing().email == request.auth.token.email || existing().invitedByUid == request.auth.uid)
+        isSignedIn() && (emailMatches(existing().email) || existing().invitedByUid == request.auth.uid)
       );
       allow create: if isValidId(invitationId) && isSignedIn() &&
         isValidInvitation(incoming()) &&
         incoming().id == invitationId &&
         incoming().status == 'PENDING' &&
         incoming().invitedByUid == request.auth.uid &&
+        ('expiresAt' in incoming()) &&
+        incoming().expiresAt is timestamp &&
+        incoming().expiresAt > request.time &&
+        incoming().expiresAt <= request.time + duration.value(30, 'd') &&
         incoming().createdAt == request.time &&
         incoming().updatedAt == request.time && (
           isSuperAdmin() ||
@@ -850,10 +941,16 @@ service cloud.firestore {
         incoming().invitedByUid == existing().invitedByUid &&
         incoming().createdAt == existing().createdAt &&
         incoming().updatedAt == request.time && (
-          (request.auth.token.email == existing().email &&
+          (emailMatches(existing().email) &&
+            (!('expiresAt' in existing()) || existing().expiresAt > request.time) &&
             incoming().status == 'ACCEPTED' &&
             incoming().acceptedByUid == request.auth.uid &&
-            incoming().diff(existing()).affectedKeys().hasOnly(['status', 'acceptedByUid', 'updatedAt'])
+            incoming().diff(existing()).affectedKeys().hasOnly(['status', 'acceptedByUid', 'updatedAt']) && (
+              (existing().role == 'GYM_OWNER' &&
+                gymExists(existing().gymId) &&
+                get(/databases/$(database)/documents/gyms/$(existing().gymId)).data.accountStatus == 'ACTIVE') ||
+              (existing().role != 'GYM_OWNER' && isGymActive(existing().gymId))
+            )
           ) ||
           ((isSuperAdmin() || (isGymOwner(existing().gymId) && existing().role != 'GYM_OWNER')) &&
             incoming().status == 'REVOKED' &&
@@ -880,7 +977,8 @@ service cloud.firestore {
             isPublicRegistrationAllowed() &&
             incoming().ownerUid == request.auth.uid &&
             incoming().accountStatus == 'ACTIVE' &&
-            incoming().subscriptionStatus in ['TRIAL', 'PENDING']
+            incoming().subscriptionStatus in ['TRIAL', 'PENDING'] &&
+            isValidSelfRegisteredGymSubscription(incoming())
           )
         );
       allow update: if isValidId(gymId) && isSignedIn() &&
@@ -910,6 +1008,7 @@ service cloud.firestore {
             incoming().subscriptionPlanId == existing().subscriptionPlanId &&
             incoming().subscriptionStartAt == existing().subscriptionStartAt &&
             incoming().subscriptionEndAt == existing().subscriptionEndAt &&
+            incoming().subscriptionAccessUntil == existing().subscriptionAccessUntil &&
             incoming().gracePeriodDays == existing().gracePeriodDays &&
             incoming().diff(existing()).affectedKeys().hasOnly([
               'name', 'phone', 'address', 'renewalPolicy', 'updatedAt'
@@ -923,9 +1022,16 @@ service cloud.firestore {
       // -----------------------------------------------------------------------
       match /settings/{settingId} {
         allow get: if isValidId(gymId) && isValidId(settingId) && (
-          isSuperAdmin() || (isGymStaff(gymId) && isGymActive(gymId))
+          isSuperAdmin() || (
+            isGymActive(gymId) &&
+            staffHasAny4(gymId, 'canManageReminders', 'canViewMembers', 'canManageMembers', 'canViewReports')
+          )
         );
-        allow list: if isSuperAdmin() || (isGymStaff(gymId) && existing().gymId == gymId && isGymActive(gymId));
+        allow list: if isSuperAdmin() || (
+          isGymActive(gymId) &&
+          existing().gymId == gymId &&
+          staffHasAny4(gymId, 'canManageReminders', 'canViewMembers', 'canManageMembers', 'canViewReports')
+        );
         allow create: if isValidId(gymId) && isValidId(settingId) &&
           isValidGymSettings(incoming(), gymId) &&
           incoming().updatedAt == request.time && (
@@ -944,32 +1050,46 @@ service cloud.firestore {
                 'whatsappPhoneNumberId', 'whatsappApprovedTemplate', 'currencySymbol', 'updatedAt'
               ])) ||
             (isGymActive(gymId) && staffHasPerm(gymId, 'canManageReminders') &&
-              incoming().diff(existing()).affectedKeys().hasOnly(['lastReminderRunDate', 'updatedAt']))
+              incoming().diff(existing()).affectedKeys().hasOnly([
+                'reminderDaysBefore', 'sendOnExpiryDay', 'sendAfterExpiryDays',
+                'paymentRemindersEnabled', 'upcomingPaymentReminderDays',
+                'overduePaymentReminderDays', 'ownerSubReminderDays', 'lastReminderRunDate',
+                'emailEnabled', 'inAppEnabled', 'updatedAt'
+              ]))
           );
         allow delete: if false;
       }
 
       match /staff/{staffId} {
         allow get: if isValidId(gymId) && isValidId(staffId) && (
-          isSuperAdmin() || (isGymStaff(gymId) && isGymActive(gymId))
+          isSuperAdmin() || (
+            isGymActive(gymId) &&
+            (isGymOwner(gymId) || (request.auth.uid == staffId && isGymStaff(gymId)))
+          )
         );
-        allow list: if isSuperAdmin() || (isGymStaff(gymId) && existing().gymId == gymId && isGymActive(gymId));
+        allow list: if isSuperAdmin() || (
+          isGymActive(gymId) && existing().gymId == gymId && isGymOwner(gymId)
+        );
         allow create: if isValidId(gymId) && isValidId(staffId) &&
           isValidGymStaff(incoming(), gymId) &&
           incoming().id == staffId &&
           incoming().createdAt == request.time &&
           incoming().updatedAt == request.time && (
             isSuperAdmin() ||
-            (getAfter(/databases/$(database)/documents/gyms/$(gymId)).data.accountStatus == 'ACTIVE' && (
-              (isSignedIn() && getAfter(/databases/$(database)/documents/gyms/$(gymId)).data.ownerUid == request.auth.uid) ||
-              (isSignedIn() &&
-                incoming().uid == request.auth.uid &&
-                incoming().email == request.auth.token.email &&
-                incoming().role in ['GYM_OWNER', 'GYM_MANAGER', 'GYM_RECEPTIONIST', 'GYM_TRAINER'] &&
-                ('invitationId' in incoming()) &&
-                isAcceptedInviteForUser(incoming().invitationId, gymId, incoming().role)
+            (isSignedIn() &&
+              staffId == request.auth.uid &&
+              incoming().uid == request.auth.uid &&
+              emailMatches(incoming().email) &&
+              incoming().status == 'ACTIVE' && (
+                (incoming().role == 'GYM_OWNER' && isPendingGymOwnerAfter(gymId)) ||
+                (incoming().role in ['GYM_MANAGER', 'GYM_RECEPTIONIST', 'GYM_TRAINER'] &&
+                  ('invitationId' in incoming()) &&
+                  isGymActiveAfter(gymId) &&
+                  isAcceptedInviteForUser(incoming().invitationId, gymId, incoming().role) &&
+                  incoming().permissions == getAfter(/databases/$(database)/documents/invitations/$(incoming().invitationId)).data.permissions
+                )
               )
-            ))
+            )
           );
         allow update: if isValidId(gymId) && isValidId(staffId) &&
           isValidGymStaff(incoming(), gymId) &&
@@ -986,40 +1106,53 @@ service cloud.firestore {
 
       match /membership_plans/{planId} {
         allow get: if isValidId(gymId) && isValidId(planId) && (
-          isSuperAdmin() || (isGymStaff(gymId) && isGymActive(gymId))
+          isSuperAdmin() || (
+            isGymActive(gymId) &&
+            staffHasAny3(gymId, 'canManagePlans', 'canViewMembers', 'canManageMembers')
+          )
         );
-        allow list: if isSuperAdmin() || (isGymStaff(gymId) && existing().gymId == gymId && isGymActive(gymId));
+        allow list: if isSuperAdmin() || (
+          isGymActive(gymId) &&
+          existing().gymId == gymId &&
+          staffHasAny3(gymId, 'canManagePlans', 'canViewMembers', 'canManageMembers')
+        );
         allow create: if isValidId(gymId) && isValidId(planId) &&
           isValidMembershipPlan(incoming(), gymId) &&
           incoming().id == planId &&
           incoming().createdAt == request.time &&
           incoming().updatedAt == request.time &&
-          (isSuperAdmin() || (isGymActive(gymId) && (isGymManagerOrOwner(gymId) || staffHasPerm(gymId, 'canManagePlans'))));
+          (isSuperAdmin() || (isGymActive(gymId) && staffHasPerm(gymId, 'canManagePlans')));
         allow update: if isValidId(gymId) && isValidId(planId) &&
           isValidMembershipPlan(incoming(), gymId) &&
           incoming().id == existing().id &&
           incoming().gymId == existing().gymId &&
           incoming().createdAt == existing().createdAt &&
           incoming().updatedAt == request.time &&
-          (isSuperAdmin() || (isGymActive(gymId) && (isGymManagerOrOwner(gymId) || staffHasPerm(gymId, 'canManagePlans')))) &&
+          (isSuperAdmin() || (isGymActive(gymId) && staffHasPerm(gymId, 'canManagePlans'))) &&
           incoming().diff(existing()).affectedKeys().hasOnly([
             'name', 'durationType', 'durationValue', 'price', 'description', 'benefits', 'status', 'updatedAt'
           ]);
         allow delete: if isValidId(gymId) && isValidId(planId) &&
-          (isSuperAdmin() || (isGymActive(gymId) && (isGymOwner(gymId) || staffHasPerm(gymId, 'canManagePlans'))));
+          (isSuperAdmin() || (isGymActive(gymId) && staffHasPerm(gymId, 'canManagePlans')));
       }
 
       match /members/{memberId} {
         allow get: if isValidId(gymId) && isValidId(memberId) && (
-          isSuperAdmin() || (isGymStaff(gymId) && isGymActive(gymId))
+          isSuperAdmin() || (
+            isGymActive(gymId) && staffHasAny2(gymId, 'canViewMembers', 'canManageMembers')
+          )
         );
-        allow list: if isSuperAdmin() || (isGymStaff(gymId) && existing().gymId == gymId && isGymActive(gymId));
+        allow list: if isSuperAdmin() || (
+          isGymActive(gymId) &&
+          existing().gymId == gymId &&
+          staffHasAny2(gymId, 'canViewMembers', 'canManageMembers')
+        );
         allow create: if isValidId(gymId) && isValidId(memberId) &&
           isValidMember(incoming(), gymId) &&
           incoming().id == memberId &&
           incoming().createdAt == request.time &&
           incoming().updatedAt == request.time &&
-          (isSuperAdmin() || (isGymStaff(gymId) && isGymActive(gymId)));
+          (isSuperAdmin() || (isGymActive(gymId) && staffHasPerm(gymId, 'canManageMembers')));
         allow update: if isValidId(gymId) && isValidId(memberId) &&
           isValidMember(incoming(), gymId) &&
           incoming().id == existing().id &&
@@ -1027,63 +1160,74 @@ service cloud.firestore {
           incoming().memberCode == existing().memberCode &&
           incoming().createdAt == existing().createdAt &&
           incoming().updatedAt == request.time && (
-            isSuperAdmin() ||
-            (isGymStaff(gymId) && isGymActive(gymId) && incoming().diff(existing()).affectedKeys().hasOnly([
-              'fullName', 'phone', 'email', 'gender', 'dateOfBirth', 'address',
-              'emergencyContact', 'currentPlanId', 'currentPlanName',
-              'membershipStartDate', 'membershipExpiryDate', 'membershipStatus',
-              'outstandingBalance', 'reminderOptOut', 'notes', 'isArchived', 'updatedAt'
-            ]))
+            isSuperAdmin() || (
+              isGymActive(gymId) && (
+                (staffHasPerm(gymId, 'canManageMembers') &&
+                  incoming().diff(existing()).affectedKeys().hasOnly([
+                    'fullName', 'phone', 'email', 'gender', 'dateOfBirth', 'address',
+                    'emergencyContact', 'currentPlanId', 'currentPlanName',
+                    'membershipStartDate', 'membershipExpiryDate', 'membershipStatus',
+                    'outstandingBalance', 'reminderOptOut', 'notes', 'isArchived', 'updatedAt'
+                  ])) ||
+                (staffHasPerm(gymId, 'canConfirmPayments') &&
+                  incoming().diff(existing()).affectedKeys().hasOnly([
+                    'outstandingBalance', 'updatedAt'
+                  ]))
+              )
+            )
           );
         allow delete: if isValidId(gymId) && isValidId(memberId) &&
-          (isSuperAdmin() || (isGymActive(gymId) && (isGymOwner(gymId) || staffHasPerm(gymId, 'canDeleteMembers'))));
+          (isSuperAdmin() || (isGymActive(gymId) && staffHasPerm(gymId, 'canDeleteMembers')));
       }
 
       match /memberships/{membershipId} {
         allow get: if isValidId(gymId) && isValidId(membershipId) && (
-          isSuperAdmin() || (isGymStaff(gymId) && isGymActive(gymId))
+          isSuperAdmin() || (
+            isGymActive(gymId) && staffHasAny2(gymId, 'canViewMembers', 'canManageMembers')
+          )
         );
-        allow list: if isSuperAdmin() || (isGymStaff(gymId) && existing().gymId == gymId && isGymActive(gymId));
+        allow list: if isSuperAdmin() || (
+          isGymActive(gymId) &&
+          existing().gymId == gymId &&
+          staffHasAny2(gymId, 'canViewMembers', 'canManageMembers')
+        );
         allow create: if isValidId(gymId) && isValidId(membershipId) &&
           isValidMembership(incoming(), gymId) &&
           incoming().id == membershipId &&
           incoming().recordedByUid == request.auth.uid &&
           incoming().createdAt == request.time &&
           incoming().updatedAt == request.time &&
-          (isSuperAdmin() || (isGymStaff(gymId) && isGymActive(gymId)));
+          (isSuperAdmin() || (isGymActive(gymId) && staffHasPerm(gymId, 'canManageMembers')));
         allow update: if isValidId(gymId) && isValidId(membershipId) &&
           isValidMembership(incoming(), gymId) &&
           incoming().id == existing().id &&
           incoming().gymId == existing().gymId &&
           incoming().memberId == existing().memberId &&
           incoming().createdAt == existing().createdAt &&
-          incoming().updatedAt == request.time &&
-          (isSuperAdmin() || (isGymStaff(gymId) && isGymActive(gymId))) &&
-          incoming().diff(existing()).affectedKeys().hasOnly([
-            'amountPaid', 'balanceDue', 'status', 'expiryDate',
-            'cancelledAt', 'cancellationReason', 'notes', 'updatedAt'
-          ]);
+          incoming().updatedAt == request.time && (
+            isSuperAdmin() || (
+              isGymActive(gymId) && (
+                (staffHasPerm(gymId, 'canManageMembers') &&
+                  incoming().diff(existing()).affectedKeys().hasOnly([
+                    'amountPaid', 'balanceDue', 'status', 'expiryDate',
+                    'cancelledAt', 'cancellationReason', 'notes', 'updatedAt'
+                  ])) ||
+                (staffHasPerm(gymId, 'canConfirmPayments') &&
+                  incoming().diff(existing()).affectedKeys().hasOnly([
+                    'amountPaid', 'balanceDue', 'updatedAt'
+                  ]))
+              )
+            )
+          );
         allow delete: if false;
       }
 
       match /member_payments/{paymentId} {
         allow get: if isValidId(gymId) && isValidId(paymentId) && (
-          isSuperAdmin() || (
-            isGymActive(gymId) && (
-              isGymManagerOrOwner(gymId) ||
-              staffHasPerm(gymId, 'canViewPayments') ||
-              staffHasPerm(gymId, 'canRecordPayments') ||
-              staffHasPerm(gymId, 'canConfirmPayments')
-            )
-          )
+          isSuperAdmin() || (isGymActive(gymId) && staffHasPerm(gymId, 'canViewPayments'))
         );
         allow list: if isSuperAdmin() || (
-          isGymActive(gymId) && existing().gymId == gymId && (
-            isGymManagerOrOwner(gymId) ||
-            staffHasPerm(gymId, 'canViewPayments') ||
-            staffHasPerm(gymId, 'canRecordPayments') ||
-            staffHasPerm(gymId, 'canConfirmPayments')
-          )
+          isGymActive(gymId) && existing().gymId == gymId && staffHasPerm(gymId, 'canViewPayments')
         );
         allow create: if isValidId(gymId) && isValidId(paymentId) &&
           isValidMemberPayment(incoming(), gymId) &&
@@ -1092,11 +1236,10 @@ service cloud.firestore {
           incoming().createdAt == request.time &&
           incoming().updatedAt == request.time && (
             isSuperAdmin() || (
-              isGymActive(gymId) && (
-                isGymManagerOrOwner(gymId) || (
-                  staffHasPerm(gymId, 'canRecordPayments') &&
-                  (incoming().status == 'PENDING' || staffHasPerm(gymId, 'canConfirmPayments'))
-                )
+              isGymActive(gymId) &&
+              staffHasPerm(gymId, 'canRecordPayments') && (
+                incoming().status == 'PENDING' ||
+                (incoming().status == 'CONFIRMED' && staffHasPerm(gymId, 'canConfirmPayments'))
               )
             )
           );
@@ -1110,10 +1253,8 @@ service cloud.firestore {
           incoming().createdAt == existing().createdAt &&
           incoming().updatedAt == request.time && (
             isSuperAdmin() || (
-              isGymActive(gymId) && (
-                isGymManagerOrOwner(gymId) ||
-                (existing().status == 'PENDING' && staffHasPerm(gymId, 'canConfirmPayments'))
-              ) && (
+              isGymActive(gymId) &&
+              staffHasPerm(gymId, 'canConfirmPayments') && (
                 (existing().status == 'PENDING' &&
                   incoming().status in ['CONFIRMED', 'REJECTED'] &&
                   incoming().diff(existing()).affectedKeys().hasOnly([
@@ -1132,49 +1273,33 @@ service cloud.firestore {
 
       match /payment_receipts/{receiptId} {
         allow get: if isValidId(gymId) && isValidId(receiptId) && (
-          isSuperAdmin() || (
-            isGymActive(gymId) && (
-              isGymManagerOrOwner(gymId) ||
-              staffHasPerm(gymId, 'canViewPayments') ||
-              staffHasPerm(gymId, 'canConfirmPayments')
-            )
-          )
+          isSuperAdmin() || (isGymActive(gymId) && staffHasPerm(gymId, 'canViewPayments'))
         );
         allow list: if isSuperAdmin() || (
-          isGymActive(gymId) && existing().gymId == gymId && (
-            isGymManagerOrOwner(gymId) ||
-            staffHasPerm(gymId, 'canViewPayments') ||
-            staffHasPerm(gymId, 'canConfirmPayments')
-          )
+          isGymActive(gymId) && existing().gymId == gymId && staffHasPerm(gymId, 'canViewPayments')
         );
         allow create: if isValidId(gymId) && isValidId(receiptId) &&
           isValidPaymentReceipt(incoming(), gymId) &&
           incoming().id == receiptId &&
           incoming().issuedByUid == request.auth.uid &&
-          incoming().issuedAt == request.time && (
-            isSuperAdmin() || (
-              isGymActive(gymId) &&
-              (isGymManagerOrOwner(gymId) || staffHasPerm(gymId, 'canConfirmPayments'))
-            )
-          );
+          incoming().issuedAt == request.time &&
+          (isSuperAdmin() || (isGymActive(gymId) && staffHasPerm(gymId, 'canConfirmPayments')));
         allow update, delete: if false;
       }
 
       match /attendance/{attendanceId} {
         allow get: if isValidId(gymId) && isValidId(attendanceId) && (
-          isSuperAdmin() || (isGymStaff(gymId) && isGymActive(gymId))
+          isSuperAdmin() || (isGymActive(gymId) && staffHasPerm(gymId, 'canManageAttendance'))
         );
-        allow list: if isSuperAdmin() || (isGymStaff(gymId) && existing().gymId == gymId && isGymActive(gymId));
+        allow list: if isSuperAdmin() || (
+          isGymActive(gymId) && existing().gymId == gymId && staffHasPerm(gymId, 'canManageAttendance')
+        );
         allow create: if isValidId(gymId) && isValidId(attendanceId) &&
           isValidAttendanceRecord(incoming(), gymId) &&
           incoming().id == attendanceId &&
           incoming().recordedByUid == request.auth.uid &&
-          incoming().createdAt == request.time && (
-            isSuperAdmin() || (
-              isGymActive(gymId) &&
-              (isGymManagerOrOwner(gymId) || staffHasPerm(gymId, 'canManageAttendance'))
-            )
-          );
+          incoming().createdAt == request.time &&
+          (isSuperAdmin() || (isGymActive(gymId) && staffHasPerm(gymId, 'canManageAttendance')));
         allow update: if isValidId(gymId) && isValidId(attendanceId) &&
           isValidAttendanceRecord(incoming(), gymId) &&
           incoming().id == existing().id &&
@@ -1182,69 +1307,68 @@ service cloud.firestore {
           incoming().memberId == existing().memberId &&
           incoming().checkInDate == existing().checkInDate &&
           incoming().checkInTime == existing().checkInTime &&
-          incoming().createdAt == existing().createdAt && (
-            isSuperAdmin() || (
-              isGymActive(gymId) &&
-              (isGymManagerOrOwner(gymId) || staffHasPerm(gymId, 'canManageAttendance'))
-            )
-          ) &&
+          incoming().createdAt == existing().createdAt &&
+          (isSuperAdmin() || (isGymActive(gymId) && staffHasPerm(gymId, 'canManageAttendance'))) &&
           incoming().diff(existing()).affectedKeys().hasOnly(['checkOutTime', 'notes']);
         allow delete: if false;
       }
 
       match /notifications/{notificationId} {
         allow get: if isValidId(gymId) && isValidId(notificationId) && (
-          isSuperAdmin() || (isGymStaff(gymId) && isGymActive(gymId))
+          isSuperAdmin() || (
+            isGymActive(gymId) &&
+            staffHasAny3(gymId, 'canManageReminders', 'canViewReports', 'canManageMembers')
+          )
         );
-        allow list: if isSuperAdmin() || (isGymStaff(gymId) && existing().gymId == gymId && isGymActive(gymId));
+        allow list: if isSuperAdmin() || (
+          isGymActive(gymId) &&
+          existing().gymId == gymId &&
+          staffHasAny3(gymId, 'canManageReminders', 'canViewReports', 'canManageMembers')
+        );
         allow create: if isValidId(gymId) && isValidId(notificationId) &&
           isValidGymNotification(incoming(), gymId) &&
           incoming().id == notificationId &&
-          incoming().createdAt == request.time &&
-          (isSuperAdmin() || (isGymStaff(gymId) && isGymActive(gymId)));
+          incoming().createdAt == request.time && (
+            isSuperAdmin() || (
+              isGymActive(gymId) &&
+              staffHasAny4(gymId, 'canManageMembers', 'canRecordPayments', 'canConfirmPayments', 'canManageReminders')
+            )
+          );
         allow update: if isValidId(gymId) && isValidId(notificationId) &&
           isValidGymNotification(incoming(), gymId) &&
           incoming().id == existing().id &&
           incoming().gymId == existing().gymId &&
-          incoming().createdAt == existing().createdAt &&
-          (isSuperAdmin() || (isGymStaff(gymId) && isGymActive(gymId))) &&
+          incoming().createdAt == existing().createdAt && (
+            isSuperAdmin() || (
+              isGymActive(gymId) &&
+              staffHasAny3(gymId, 'canManageReminders', 'canViewReports', 'canManageMembers')
+            )
+          ) &&
           incoming().diff(existing()).affectedKeys().hasOnly(['isRead']);
         allow delete: if false;
       }
 
       match /notification_logs/{logId} {
         allow get: if isValidId(gymId) && isValidId(logId) && (
-          isSuperAdmin() || (
-            isGymActive(gymId) &&
-            (isGymManagerOrOwner(gymId) || staffHasPerm(gymId, 'canManageReminders'))
-          )
+          isSuperAdmin() || (isGymActive(gymId) && staffHasPerm(gymId, 'canManageReminders'))
         );
         allow list: if isSuperAdmin() || (
-          isGymActive(gymId) && existing().gymId == gymId &&
-          (isGymManagerOrOwner(gymId) || staffHasPerm(gymId, 'canManageReminders'))
+          isGymActive(gymId) && existing().gymId == gymId && staffHasPerm(gymId, 'canManageReminders')
         );
         allow create: if isValidId(gymId) && isValidId(logId) &&
           isValidNotificationLog(incoming(), gymId) &&
           incoming().id == logId &&
           incoming().createdAt == request.time &&
-          incoming().updatedAt == request.time && (
-            isSuperAdmin() || (
-              isGymActive(gymId) &&
-              (isGymManagerOrOwner(gymId) || staffHasPerm(gymId, 'canManageReminders'))
-            )
-          );
+          incoming().updatedAt == request.time &&
+          (isSuperAdmin() || (isGymActive(gymId) && staffHasPerm(gymId, 'canManageReminders')));
         allow update: if isValidId(gymId) && isValidId(logId) &&
           isValidNotificationLog(incoming(), gymId) &&
           incoming().id == existing().id &&
           incoming().gymId == existing().gymId &&
           incoming().dedupKey == existing().dedupKey &&
           incoming().createdAt == existing().createdAt &&
-          incoming().updatedAt == request.time && (
-            isSuperAdmin() || (
-              isGymActive(gymId) &&
-              (isGymManagerOrOwner(gymId) || staffHasPerm(gymId, 'canManageReminders'))
-            )
-          ) &&
+          incoming().updatedAt == request.time &&
+          (isSuperAdmin() || (isGymActive(gymId) && staffHasPerm(gymId, 'canManageReminders'))) &&
           incoming().diff(existing()).affectedKeys().hasOnly([
             'deliveryStatus', 'retryCount', 'errorDetails',
             'providerMessageId', 'sentAt', 'lastAttemptAt', 'nextRetryAt', 'updatedAt'
@@ -1292,10 +1416,11 @@ service cloud.firestore {
         isValidAuditLog(incoming()) &&
         incoming().id == logId &&
         incoming().actorUid == request.auth.uid &&
+        emailMatches(incoming().actorEmail) &&
         incoming().createdAt == request.time && (
           !('gymId' in incoming()) ? isSuperAdmin() : (
             isSuperAdmin() ||
-            (isActiveUser() && userData().gymId == incoming().gymId) ||
+            isGymStaff(incoming().gymId) ||
             (existsAfter(/databases/$(database)/documents/users/$(request.auth.uid)) &&
               isUserActiveInGymAfter(incoming().gymId)) ||
             getAfter(/databases/$(database)/documents/gyms/$(incoming().gymId)).data.ownerUid == request.auth.uid

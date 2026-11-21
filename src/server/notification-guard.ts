@@ -263,7 +263,7 @@ export async function authorizeAndResolveNotificationDispatch(params: {
         const perms = (staff.permissions || {}) as Record<string, unknown>;
         if (
           staff.status === 'ACTIVE' &&
-          (userRole === 'GYM_MANAGER' || perms.canManageReminders === true)
+          perms.canManageReminders === true
         ) {
           authorized = true;
         }
@@ -312,9 +312,9 @@ export async function authorizeAndResolveNotificationDispatch(params: {
     todayIso
   );
   const accessUntilMs = timestampValueToMillis(gymData.subscriptionAccessUntil);
-  const accessTimestampExpired = accessUntilMs !== null && accessUntilMs <= nowMs;
+  const accessTimestampMissingOrExpired = accessUntilMs === null || accessUntilMs <= nowMs;
 
-  if (accessState.isLocked || accessTimestampExpired) {
+  if (accessState.isLocked || accessTimestampMissingOrExpired) {
     await writeSecurityAuditLog(db, serverTimestamp, {
       actorUid: actor.uid,
       actorEmail: actor.email,
