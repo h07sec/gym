@@ -14,7 +14,7 @@ cp .env.example .env
 - `FIREBASE_SERVICE_ACCOUNT_JSON` (single-line JSON string) or `GOOGLE_APPLICATION_CREDENTIALS`: Required outside Google Cloud ADC environments for `POST /api/notifications/send`, `POST /api/admin/bootstrap`, `scripts/init-super-admin.mjs`, and `POST /api/cron/reminders` / background automated reminder generation & retry sweeps.
 - `SUPER_ADMIN_BOOTSTRAP_TOKEN` and `SUPER_ADMIN_BOOTSTRAP_EMAIL`: Required together for one-time initial Super Admin bootstrap via `/admin` (`POST /api/admin/bootstrap`). Automatically locked via `/platform_bootstrap/default` and invalidated in memory after first success; clear both after setup.
 - `SMTP_HOST`, `SMTP_PORT`, `SMTP_SECURE`, `SMTP_USER`, `SMTP_PASS`, `SMTP_FROM`: Free-first SMTP email configuration for member & owner reminders.
-- `WHATSAPP_CLOUD_ACCESS_TOKEN`, `WHATSAPP_API_VERSION`: Optional official Meta WhatsApp Business Cloud API token. Each gym still requires its own Phone Number ID and approved template in **Reminders**.
+- `WHATSAPP_CLOUD_ACCESS_TOKEN`, `WHATSAPP_API_VERSION`: Optional official Meta WhatsApp Cloud API token. Each gym still requires its own Phone Number ID and approved template in **Reminders**.
 - `CRON_SECRET`: Shared bearer token protecting `POST /api/cron/reminders`.
 - `REMINDER_WORKER_INTERVAL_MINUTES` (default `30`, set `0` to disable): Interval for automatic server-side due-reminder evaluation, in-app/email/WhatsApp dispatch, and exponential-backoff retries (`15m -> 60m -> 240m`, max 3 retries) with distributed Firestore worker locking (`system_locks/*`).
 
@@ -29,6 +29,7 @@ docker compose up --build -d
 ```
 
 Verify container health:
+
 ```bash
 curl -s http://localhost:3000/healthz
 ```
@@ -55,7 +56,9 @@ Endpoints exposed by `dist-server/server.mjs`:
 
 ## 4. Deploying Firestore Security Rules
 
-Always lint and deploy `firestore.rules` before releasing frontend changes:
+**Important:** The app is configured to use the named Firestore database `ai-studio-41ae310f-363a-4e9f-a08f-b95b76f8f4e9`, not the project's default `(default)` database. The `firestore.database` entry in `firebase.json` explicitly targets that database. Keep it aligned with `firestoreDatabaseId` in `firebase-applet-config.json`.
+
+Always lint and deploy Firestore security rules before releasing frontend changes:
 
 ```bash
 bun run lint:rules
@@ -63,6 +66,7 @@ firebase deploy --only firestore:rules
 ```
 
 To run the full Firebase Emulator integration suite in CI or on a workstation with Java installed:
+
 ```bash
 bun run test:emulator
 ```
@@ -72,6 +76,6 @@ bun run test:emulator
 If running on serverless containers or disabling the in-process interval (`REMINDER_WORKER_INTERVAL_MINUTES=0`), schedule an external cron job daily or hourly:
 
 ```bash
-curl -X POST https://your-domain.com/api/cron/reminders \
+curl -X POST https://your-domain.com/api/cron/reminders \\
   -H "Authorization: Bearer $CRON_SECRET"
 ```
