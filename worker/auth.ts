@@ -1,40 +1,45 @@
-import { Buffer } from 'node:buffer';
+import { importJWK, jwtVerify } from 'jose';
 
-export async function verifyIdToken(token: string, projectId: string): Promise<{ uid: string; email?: string; email_verified?: boolean }> {
-  const parts = token.split('.');
-  if (parts.length !== 3) throw new Error('Invalid token format');
+let cachedKeys: any = null;
+let cacheExpiry = 0;
 
-  const header = JSON.parse(Buffer.from(parts[0], 'base64').toString());
-  const payload = JSON.parse(Buffer.from(parts[1], 'base64').toString());
+async function getFirebasePublicKeys() {
+  const now = Date.now();
+  if (cachedKeys && now < cacheExpiry) return cachedKeys;
 
-  // 1. Validate exp, iat, auth_time
-  const now = Math.floor(Date.now() / 1000);
-  if (payload.exp < now) throw new Error('Token expired');
-  if (payload.iat > now) throw new Error('Token issued in future');
+  const resp = await fetch('https://www.googleapis.com/service_accounts/v1/jwk/securetoken@system.gserviceaccount.com');
+  const cacheControl = resp.headers.get('cache-control');
+  const maxAgeMatch = cacheControl?.match(/max-age=(\d+)/);
+  const maxAge = maxAgeMatch ? parseInt(maxAgeMatch[1], 10) : 3600;
+  
+  cachedKeys = await resp.json();
+  cacheExpiry = now + (maxAge * 1000);
+  return cachedKeys;
+}
 
-  // 2. Validate aud and iss
-  if (payload.aud !== projectId) throw new Error('Invalid audience');
-  if (payload.iss !== `https://securetoken.google.com/${projectId}`) throw new Error('Invalid issuer');
-  if (!payload.sub) throw new Error('Empty sub');
+export async function verifyIdToken(token: string, projectId: string) {
+  const jwks = await getFirebasePublicKeys();
+  const tokenParts = token.split('.');
+  if (tokenParts.length !== 3) throw new Error('Invalid token');
+  
+  const header = JSON.parse(atob(tokenParts[0]));
+  if (header.alg !== 'RS256') throw new Error('Algorithm not RS256');
+  
+  const keyData = jwks.keys.find((k: any) => k.kid === header.kid);
+  if (!keyData) {
+    // If key not found, force refresh and retry once
+    cachedKeys = null;
+    return verifyIdToken(token, projectId);
+  }
 
-  // 3. Cryptographic Signature Verification
-  const jwks = await fetch('https://www.googleapis.com/service_accounts/v1/jwk/securetoken@system.gserviceaccount.com').then(r => r.json());
-  const key = jwks.keys.find((k: any) => k.kid === header.kid);
-  if (!key) throw new Error('Key not found');
+  const key = await importJWK(keyData, 'RS256');
+  const { payload } = await jwtVerify(token, key, {
+    issuer: `https://securetoken.google.com/${projectId}`,
+    audience: projectId,
+  });
 
-  const cryptoKey = await crypto.subtle.importKey('jwk', key, { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' }, false, ['verify']);
-  const isValid = await crypto.subtle.verify(
-    'RSASSA-PKCS1-v1_5',
-    cryptoKey,
-    Buffer.from(parts[2], 'base64url'),
-    new TextEncoder().encode(`${parts[0]}.${parts[1]}`)
-  );
-
-  if (!isValid) throw new Error('Invalid signature');
-
-  return {
-    uid: payload.sub,
-    email: payload.email,
-    email_verified: payload.email_verified === true
-  };
+  if (!payload.sub || typeof payload.sub !== 'string') throw new Error('Invalid sub');
+  if (payload.email_verified !== true) throw new Error('Email not verified');
+  
+  return { uid: payload.sub, email: payload.email, email_verified: true };
 }
