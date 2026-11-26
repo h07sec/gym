@@ -1,17 +1,41 @@
 import { Hono } from 'hono';
+import { verifyIdToken } from './auth';
 
-const app = new Hono();
+type Bindings = {
+  PROJECT_ID: string;
+  RESEND_API_KEY: string;
+  EMAIL_FROM: string;
+};
 
-app.get('/api/health', (c) => {
-  return c.json({ status: 'ok', service: 'GymOS Worker' });
+const app = new Hono<{ Bindings: Bindings }>();
+
+// Health
+app.get('/api/health', (c) => c.json({ status: 'ok' }));
+
+// Auth Middleware
+app.use('/api/*', async (c, next) => {
+  const authHeader = c.req.header('Authorization');
+  if (!authHeader?.startsWith('Bearer ')) {
+    return c.json({ error: 'Unauthorized' }, 401);
+  }
+  try {
+    const user = await verifyIdToken(authHeader.split(' ')[1], c.env.PROJECT_ID);
+    if (!user.email_verified) throw new Error('Email not verified');
+    c.set('user', user);
+    await next();
+  } catch (e) {
+    return c.json({ error: 'Unauthorized' }, 401);
+  }
+});
+
+// Admin Bootstrap Placeholder
+app.post('/api/admin/bootstrap', async (c) => {
+  return c.json({ ok: true, msg: 'Bootstrap migrated to Worker' });
 });
 
 export default {
-  async fetch(request: Request, env: any, ctx: ExecutionContext) {
-    return app.fetch(request, env, ctx);
-  },
-  async scheduled(event: ScheduledEvent, env: any, ctx: ExecutionContext) {
-    // Cron trigger placeholder
+  fetch: app.fetch,
+  async scheduled(event: ScheduledEvent, env: Bindings, ctx: ExecutionContext) {
     console.log('Cron trigger executed');
   }
 };
