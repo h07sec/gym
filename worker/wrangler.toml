@@ -1,0 +1,7 @@
+name = "gymos-worker"
+main = "worker/index.ts"
+compatibility_date = "2026-11-25"
+compatibility_flags = ["nodejs_compat"]
+
+[triggers]
+crons = ["*/30 * * * *"]
